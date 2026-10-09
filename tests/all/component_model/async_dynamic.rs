@@ -4,9 +4,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 use wasmtime::component::{
-    Component, Destination, FutureAny, FutureConsumer, FutureReader, Instance, Lift, Linker,
-    Resource, ResourceType, Source, StreamAny, StreamConsumer, StreamProducer, StreamReader,
-    StreamResult, Type, TypedFunc, Val, VecBuffer, types::StreamType,
+    Component, ComponentType, Destination, FutureAny, FutureConsumer, FutureReader, Instance, Lift,
+    Linker, Lower, Resource, ResourceType, Source, StreamAny, StreamConsumer, StreamProducer,
+    StreamReader, StreamResult, Type, TypedFunc, Val, VecBuffer, types::StreamType,
 };
 use wasmtime::{Config, Engine, Result, Store, StoreContextMut};
 
@@ -625,6 +625,21 @@ async fn host_future_read_as_other_rust_type() -> Result<()> {
     Ok(())
 }
 
+/// Defines the core instance `$libc`, exporting the memory `mem` and a bump
+/// allocator `realloc`, for the test components below.
+const LIBC: &str = r#"(core module $libc
+    (memory (export "mem") 1)
+    (global $heap (mut i32) (i32.const 4096))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $ret i32)
+      (local.set $ret
+        (i32.and
+          (i32.add (global.get $heap) (i32.sub (local.get 2) (i32.const 1)))
+          (i32.sub (i32.const 0) (local.get 2))))
+      (global.set $heap (i32.add (local.get $ret) (local.get 3)))
+      (local.get $ret)))
+  (core instance $libc (instantiate $libc))"#;
+
 /// Returns a component whose `new` export creates a stream of type `$s`,
 /// defined by `types` (e.g. `(type $s (stream u32))`), whose `write` export
 /// writes the first `n` items encoded at address 100 by `data`, and whose
@@ -634,8 +649,7 @@ fn stream_writer(types: &str, data: &str) -> String {
         r#"
 (component
   {types}
-  (core module $libc (memory (export "mem") 1))
-  (core instance $libc (instantiate $libc))
+  {LIBC}
   (core func $stream.new (canon stream.new $s))
   (core func $stream.write
     (canon stream.write $s async (memory (core memory $libc "mem"))))
@@ -845,18 +859,7 @@ fn stream_forwarder(types: &str) -> String {
         r#"
 (component
   {types}
-  (core module $libc
-    (memory (export "mem") 1)
-    (global $heap (mut i32) (i32.const 4096))
-    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
-      (local $ret i32)
-      (local.set $ret
-        (i32.and
-          (i32.add (global.get $heap) (i32.sub (local.get 2) (i32.const 1)))
-          (i32.sub (i32.const 0) (local.get 2))))
-      (global.set $heap (i32.add (local.get $ret) (local.get 3)))
-      (local.get $ret)))
-  (core instance $libc (instantiate $libc))
+  {LIBC}
   (core func $stream.new (canon stream.new $s))
   (core func $stream.read
     (canon stream.read $s async (memory (core memory $libc "mem"))
@@ -957,15 +960,16 @@ fn stream_forwarder(types: &str) -> String {
 /// `r`.
 struct HostThing;
 
-/// Instantiates `stream_forwarder(types)`, returning its store, the type of
-/// stream it forwards, and its `forward` export.
-async fn forwarder(
-    types: &str,
-) -> Result<(Store<()>, StreamType, TypedFunc<(StreamAny,), (StreamAny,)>)> {
+/// Instantiates `wat`, which may import the host resource `r`, returning its
+/// store, the type of its `forward` export's parameter, and that export.
+async fn instantiate_forwarder<T>(wat: &str) -> Result<(Store<()>, Type, TypedFunc<(T,), (T,)>)>
+where
+    T: ComponentType + Lift + Lower + 'static,
+{
     let mut config = Config::new();
     config.wasm_component_model_async(true);
     let engine = Engine::new(&config)?;
-    let component = Component::new(&engine, stream_forwarder(types))?;
+    let component = Component::new(&engine, wat)?;
     let mut store = Store::new(&engine, ());
     let mut linker = Linker::new(&engine);
     linker
@@ -973,10 +977,18 @@ async fn forwarder(
         .resource("r", ResourceType::host::<HostThing>(), |_, _| Ok(()))?;
     let instance = linker.instantiate_async(&mut store, &component).await?;
     let func = instance.get_func(&mut store, "forward").unwrap();
-    let Type::Stream(ty) = func.ty(&store).params().next().unwrap().1 else {
-        unreachable!()
-    };
-    let forward = func.typed::<(StreamAny,), (StreamAny,)>(&store)?;
+    let ty = func.ty(&store).params().next().unwrap().1;
+    let forward = func.typed::<(T,), (T,)>(&store)?;
+    Ok((store, ty, forward))
+}
+
+/// Instantiates `stream_forwarder(types)`, returning its store, the type of
+/// stream it forwards, and its `forward` export.
+async fn forwarder(
+    types: &str,
+) -> Result<(Store<()>, StreamType, TypedFunc<(StreamAny,), (StreamAny,)>)> {
+    let (store, ty, forward) = instantiate_forwarder(&stream_forwarder(types)).await?;
+    let Type::Stream(ty) = ty else { unreachable!() };
     Ok((store, ty, forward))
 }
 
