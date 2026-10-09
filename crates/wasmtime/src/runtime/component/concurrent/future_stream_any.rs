@@ -314,8 +314,11 @@ impl StreamAny {
     /// [`Val`]s.
     ///
     /// This is the dynamically typed counterpart of [`StreamReader::pipe`].
-    /// The consumer reads items with [`Source::read_vals`], and each item is a
-    /// [`Val`] of the payload type reported by [`StreamAny::ty`].
+    /// The consumer reads items with [`Source::read_vals`]. Items written by a
+    /// guest are lifted as [`Val`]s of the payload type reported by
+    /// [`StreamAny::ty`]. Items written by a host producer of [`Val`]s, see
+    /// [`StreamAny::new`], are moved to the consumer as they are, without
+    /// being checked against that type.
     ///
     /// [`Source::read_vals`]: crate::component::Source::read_vals
     ///
