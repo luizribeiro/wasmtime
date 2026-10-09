@@ -9,8 +9,9 @@ use core::slice;
 pub use untyped::*;
 mod untyped {
     use super::WriteBuffer;
+    use crate::prelude::*;
     use crate::vm::SendSyncPtr;
-    use core::any::TypeId;
+    use core::any::{TypeId, type_name};
     use core::marker;
     use core::mem;
     use core::ptr::NonNull;
@@ -25,6 +26,7 @@ mod untyped {
     /// borrow on the original buffer passed in.
     pub struct UntypedWriteBuffer<'a> {
         element_type_id: TypeId,
+        element_type_name: &'static str,
         buf: SendSyncPtr<dyn WriteBuffer<()>>,
         _marker: marker::PhantomData<&'a mut dyn WriteBuffer<()>>,
     }
@@ -44,6 +46,7 @@ mod untyped {
         pub fn new<T: 'static>(buf: &'a mut dyn WriteBuffer<T>) -> UntypedWriteBuffer<'a> {
             UntypedWriteBuffer {
                 element_type_id: TypeId::of::<T>(),
+                element_type_name: type_name::<T>(),
                 // SAFETY: this is `unsafe` due to reading union fields. That
                 // is safe here because `typed` and `untyped` have the same size
                 // and we're otherwise reinterpreting a raw pointer with a type
@@ -62,21 +65,28 @@ mod untyped {
 
         /// Acquires the underlying `WriteBuffer<T>` this was created with.
         ///
-        /// # Panics
+        /// # Errors
         ///
-        /// Panics if `T` does not match the type that this was created with.
-        pub fn get_mut<T: 'static>(&mut self) -> &mut dyn WriteBuffer<T> {
-            assert_eq!(self.element_type_id, TypeId::of::<T>());
+        /// Returns an error if `T` does not match the type that this was
+        /// created with.
+        pub fn get_mut<T: 'static>(&mut self) -> Result<&mut dyn WriteBuffer<T>> {
+            if self.element_type_id != TypeId::of::<T>() {
+                bail!(
+                    "host producer of `{}` items cannot be read by a host consumer of `{}` items",
+                    self.element_type_name,
+                    type_name::<T>(),
+                );
+            }
             // SAFETY: the `T` has been checked with `TypeId` and this
             // structure also is proof of valid existence of the original
             // `&mut WriteBuffer<T>`, so taking the raw pointer back to a safe
             // reference is valid.
-            unsafe {
+            Ok(unsafe {
                 &mut *ReinterpretWriteBuffer {
                     untyped: self.buf.as_ptr(),
                 }
                 .typed
-            }
+            })
         }
     }
 }

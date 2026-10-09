@@ -1,7 +1,12 @@
+use std::mem;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::sync::oneshot;
 use wasmtime::component::{
-    Component, FutureAny, FutureReader, Linker, StreamAny, StreamReader, Val,
+    Component, FutureAny, FutureConsumer, FutureReader, Instance, Lift, Linker, Source, StreamAny,
+    StreamConsumer, StreamReader, StreamResult, Val,
 };
-use wasmtime::{Config, Engine, Result, Store};
+use wasmtime::{Config, Engine, Result, Store, StoreContextMut};
 
 #[test]
 fn simple_type_conversions() -> Result<()> {
@@ -414,5 +419,165 @@ fn future_and_stream_lowered_at_most_once() -> Result<()> {
         g.close(&mut store)?;
     }
 
+    Ok(())
+}
+
+const ECHO_STRING_FUTURES_AND_STREAMS: &str = r#"
+(component
+    (type $f (future string))
+    (type $s (stream string))
+    (core module $m
+        (func (export "echo") (param i32) (result i32) local.get 0))
+    (core instance $i (instantiate $m))
+    (func (export "echo-f") (param "f" $f) (result $f)
+        (canon lift (core func $i "echo")))
+    (func (export "echo-s") (param "s" $s) (result $s)
+        (canon lift (core func $i "echo")))
+)
+"#;
+
+/// A consumer which takes everything it's given and sends it over `done`
+/// when dropped.
+struct Collect<T> {
+    taken: Vec<T>,
+    done: Option<oneshot::Sender<Vec<T>>>,
+}
+
+impl<T> Collect<T> {
+    fn new() -> (Self, oneshot::Receiver<Vec<T>>) {
+        let (tx, rx) = oneshot::channel();
+        let consumer = Collect {
+            taken: Vec::new(),
+            done: Some(tx),
+        };
+        (consumer, rx)
+    }
+}
+
+impl<T> Drop for Collect<T> {
+    fn drop(&mut self) {
+        let _ = self.done.take().unwrap().send(mem::take(&mut self.taken));
+    }
+}
+
+impl<T: Lift + Send + Unpin + 'static> StreamConsumer<()> for Collect<T> {
+    type Item = T;
+
+    fn poll_consume(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        mut store: StoreContextMut<()>,
+        mut src: Source<'_, T>,
+        _finish: bool,
+    ) -> Poll<Result<StreamResult>> {
+        let mut buf = Vec::with_capacity(src.remaining(&mut store));
+        src.read(&mut store, &mut buf)?;
+        self.taken.extend(buf);
+        Poll::Ready(Ok(StreamResult::Completed))
+    }
+}
+
+impl<T: Lift + Send + Unpin + 'static> FutureConsumer<()> for Collect<T> {
+    type Item = T;
+
+    fn poll_consume(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        mut store: StoreContextMut<()>,
+        mut src: Source<'_, T>,
+        _finish: bool,
+    ) -> Poll<Result<()>> {
+        let mut buf = None;
+        src.read(&mut store, &mut buf)?;
+        self.taken.extend(buf);
+        Poll::Ready(Ok(()))
+    }
+}
+
+async fn instantiate_echo() -> Result<(Store<()>, Instance)> {
+    let mut config = Config::new();
+    config.wasm_component_model_async(true);
+    let engine = Engine::new(&config)?;
+    let component = Component::new(&engine, ECHO_STRING_FUTURES_AND_STREAMS)?;
+    let mut store = Store::new(&engine, ());
+    let instance = Linker::new(&engine)
+        .instantiate_async(&mut store, &component)
+        .await?;
+    Ok((store, instance))
+}
+
+/// Sends a host-produced `stream<string>` of `items` through a guest and back
+/// as a `StreamReader<T>`, then pipes it into a host consumer of `T`,
+/// returning what that consumed.
+async fn echo_host_stream<T: Lift + Send + Unpin + 'static>(items: Vec<String>) -> Result<Vec<T>> {
+    let (mut store, instance) = instantiate_echo().await?;
+    let echo = instance
+        .get_typed_func::<(StreamReader<String>,), (StreamReader<T>,)>(&mut store, "echo-s")?;
+    let reader = StreamReader::new(&mut store, items)?;
+    let (reader,) = echo.call_async(&mut store, (reader,)).await?;
+    let (consumer, done) = Collect::new();
+    reader.pipe(&mut store, consumer)?;
+    Ok(store.run_concurrent(async |_| done.await).await??)
+}
+
+/// Like `echo_host_stream`, but for a `future<string>` resolving to `item`.
+async fn echo_host_future<T: Lift + Send + Unpin + 'static>(item: String) -> Result<Vec<T>> {
+    let (mut store, instance) = instantiate_echo().await?;
+    let echo = instance
+        .get_typed_func::<(FutureReader<String>,), (FutureReader<T>,)>(&mut store, "echo-f")?;
+    let reader = FutureReader::new(&mut store, async { wasmtime::error::Ok(item) })?;
+    let (reader,) = echo.call_async(&mut store, (reader,)).await?;
+    let (consumer, done) = Collect::new();
+    reader.pipe(&mut store, consumer)?;
+    Ok(store.run_concurrent(async |_| done.await).await??)
+}
+
+fn assert_type_mismatch(err: &wasmtime::Error) {
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("String` items cannot be read by a host consumer of `")
+            && msg.contains("Box<str>` items"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn host_stream_read_as_same_rust_type() -> Result<()> {
+    let items = vec!["a".to_string(), "b".to_string()];
+    assert_eq!(echo_host_stream::<String>(items.clone()).await?, items);
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn host_stream_read_as_other_rust_type() -> Result<()> {
+    let items = vec!["a".to_string(), "b".to_string()];
+    let err = echo_host_stream::<Box<str>>(items).await.unwrap_err();
+    assert_type_mismatch(&err);
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn empty_host_stream_read_as_other_rust_type() -> Result<()> {
+    assert!(echo_host_stream::<Box<str>>(Vec::new()).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn host_future_read_as_same_rust_type() -> Result<()> {
+    assert_eq!(echo_host_future::<String>("a".to_string()).await?, ["a"]);
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn host_future_read_as_other_rust_type() -> Result<()> {
+    let err = echo_host_future::<Box<str>>("a".to_string())
+        .await
+        .unwrap_err();
+    assert_type_mismatch(&err);
     Ok(())
 }
