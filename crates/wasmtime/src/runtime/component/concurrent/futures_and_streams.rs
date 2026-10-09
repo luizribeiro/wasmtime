@@ -287,6 +287,57 @@ fn lower<T: func::Lower + Send + 'static, B: WriteBuffer<T>, U: 'static>(
     Ok(())
 }
 
+/// How a host producer's items are lowered into a guest reader's buffer.
+trait LowerItems<T>: 'static {
+    /// Whether lowering may call the guest's `realloc` function.
+    const MAY_REQUIRE_REALLOC: bool;
+
+    /// Lowers up to `count` items from `buffer` to the guest's buffer at
+    /// `address`, after the `guest_offset` items already written to it, and
+    /// removes them from `buffer`.
+    fn lower<U: 'static, B: WriteBuffer<T>>(
+        store: StoreContextMut<U>,
+        instance: Instance,
+        caller_thread: QualifiedThreadId,
+        options: OptionsIndex,
+        ty: TransmitIndex,
+        address: usize,
+        guest_offset: usize,
+        count: usize,
+        buffer: &mut B,
+    ) -> Result<()>;
+}
+
+/// Lowers statically typed items with their [`Lower`] implementation.
+struct TypedItems;
+
+impl<T: func::Lower + Send + 'static> LowerItems<T> for TypedItems {
+    const MAY_REQUIRE_REALLOC: bool = T::MAY_REQUIRE_REALLOC;
+
+    fn lower<U: 'static, B: WriteBuffer<T>>(
+        store: StoreContextMut<U>,
+        instance: Instance,
+        caller_thread: QualifiedThreadId,
+        options: OptionsIndex,
+        ty: TransmitIndex,
+        address: usize,
+        guest_offset: usize,
+        count: usize,
+        buffer: &mut B,
+    ) -> Result<()> {
+        lower::<T, B, U>(
+            store,
+            instance,
+            caller_thread,
+            options,
+            ty,
+            address + (T::SIZE32 * guest_offset),
+            count,
+            buffer,
+        )
+    }
+}
+
 fn lift<T: func::Lift + Send + 'static, B: ReadBuffer<T>>(
     lift: &mut LiftContext<'_>,
     ty: Option<InterfaceType>,
@@ -1437,7 +1488,7 @@ impl<T> FutureReader<T> {
         Ok(Self::new_(
             store
                 .as_context_mut()
-                .new_transmit(TransmitKind::Future, Producer(producer))?,
+                .new_transmit::<_, TypedItems>(TransmitKind::Future, Producer(producer))?,
         ))
     }
 
@@ -1794,7 +1845,7 @@ impl<T> StreamReader<T> {
         Ok(Self::new_(
             store
                 .as_context_mut()
-                .new_transmit(TransmitKind::Stream, producer)?,
+                .new_transmit::<_, TypedItems>(TransmitKind::Stream, producer)?,
         ))
     }
 
@@ -2722,14 +2773,11 @@ impl StoreOpaque {
 }
 
 impl<T> StoreContextMut<'_, T> {
-    fn new_transmit<P: StreamProducer<T>>(
+    fn new_transmit<P: StreamProducer<T>, L: LowerItems<P::Item>>(
         mut self,
         kind: TransmitKind,
         producer: P,
-    ) -> Result<HostResourceIndex>
-    where
-        P::Item: func::Lower,
-    {
+    ) -> Result<HostResourceIndex> {
         let token = StoreToken::new(self.as_context_mut());
         let state = self.0.concurrent_state_mut()?;
         let (_, read) = state.new_transmit(TransmitOrigin::Host {
@@ -2883,7 +2931,7 @@ impl<T> StoreContextMut<'_, T> {
                     drop(state);
 
                     if write_buffer {
-                        write(token, id, producer.clone(), kind).await?;
+                        write::<_, _, _, _, L>(token, id, producer.clone(), kind).await?;
                     }
 
                     Ok(if dropped {
@@ -3139,7 +3187,7 @@ impl<T> StoreContextMut<'_, T> {
     }
 }
 
-async fn write<D: 'static, P: Send + 'static, T: func::Lower + 'static, B: WriteBuffer<T>>(
+async fn write<D: 'static, P: Send + 'static, T: 'static, B: WriteBuffer<T>, L: LowerItems<T>>(
     token: StoreToken<D>,
     id: TableId<TransmitState>,
     pair: Arc<LockedState<(P, B)>>,
@@ -3189,13 +3237,14 @@ async fn write<D: 'static, P: Send + 'static, T: func::Lower + 'static, B: Write
                 let pair = pair.clone();
                 move |mut store: StoreContextMut<D>| {
                     let mut state = pair.take()?;
-                    lower::<T, B, D>(
+                    L::lower(
                         store.as_context_mut(),
                         instance,
                         caller_thread,
                         options,
                         ty,
-                        address + (T::SIZE32 * guest_offset.as_usize()),
+                        address,
+                        guest_offset.as_usize(),
                         count.as_usize() - guest_offset.as_usize(),
                         &mut state.1,
                     )?;
@@ -3204,7 +3253,7 @@ async fn write<D: 'static, P: Send + 'static, T: func::Lower + 'static, B: Write
             };
 
             if guest_offset < count {
-                if T::MAY_REQUIRE_REALLOC {
+                if L::MAY_REQUIRE_REALLOC {
                     // For payloads which may require a realloc call, use a
                     // oneshot::channel and background task.  This is
                     // necessary because calling the guest while there are
