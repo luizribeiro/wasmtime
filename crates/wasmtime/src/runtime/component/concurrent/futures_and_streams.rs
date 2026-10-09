@@ -384,35 +384,57 @@ impl LowerItems<Val> for ValItems {
         count: usize,
         buffer: &mut B,
     ) -> Result<()> {
-        let count = buffer.remaining().len().min(count);
         let old_thread = store.0.set_thread(caller_thread)?;
-        let lower = &mut LowerContext::new(store.as_context_mut(), options, instance);
-        let Some(&ty) = ty.payload(lower.types) else {
-            bail_bug!("payload-less streams should have been refused before writing `Val`s")
-        };
-        let abi = lower.types.canonical_abi(&ty);
-        let size = usize::try_from(abi.size32)?;
-        let address = address + size * guest_offset;
-        check_guest_buffer(
-            lower.as_slice_mut(),
-            "read",
+        let stored = store_vals(
+            &mut LowerContext::new(store.as_context_mut(), options, instance),
+            ty,
             address,
-            size,
-            abi.align32,
+            guest_offset,
             count,
-        )?;
-
-        // Remove each item from `buffer` once it is stored so that, if storing
-        // a later one fails, those before it (and any handles they own) are
-        // not stored again.
-        for i in 0..count {
-            buffer.remaining()[0].store(lower, ty, address + size * i)?;
-            buffer.skip(1);
-        }
-
+            buffer,
+        );
+        // Restore the thread even if storing failed, since this may run in a
+        // worker fiber which is reused afterwards.
         store.0.set_thread(old_thread)?;
-        Ok(())
+        stored
     }
+}
+
+/// Stores up to `count` items from `buffer` into the guest's buffer at
+/// `address`, after the `guest_offset` items already written to it, and
+/// removes them from `buffer`.
+fn store_vals<U, B: WriteBuffer<Val>>(
+    lower: &mut LowerContext<'_, U>,
+    ty: TransmitIndex,
+    address: usize,
+    guest_offset: usize,
+    count: usize,
+    buffer: &mut B,
+) -> Result<()> {
+    let count = buffer.remaining().len().min(count);
+    let Some(&ty) = ty.payload(lower.types) else {
+        bail_bug!("payload-less streams should have been refused before writing `Val`s")
+    };
+    let abi = lower.types.canonical_abi(&ty);
+    let size = usize::try_from(abi.size32)?;
+    let address = address + size * guest_offset;
+    check_guest_buffer(
+        lower.as_slice_mut(),
+        "read",
+        address,
+        size,
+        abi.align32,
+        count,
+    )?;
+
+    // Remove each item from `buffer` once it is stored so that, if storing a
+    // later one fails, those before it (and any handles they own) are not
+    // stored again.
+    for i in 0..count {
+        buffer.remaining()[0].store(lower, ty, address + size * i)?;
+        buffer.skip(1);
+    }
+    Ok(())
 }
 
 fn lift<T: func::Lift + Send + 'static, B: ReadBuffer<T>>(
