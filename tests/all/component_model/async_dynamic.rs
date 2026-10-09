@@ -436,21 +436,52 @@ const ECHO_STRING_FUTURES_AND_STREAMS: &str = r#"
 )
 "#;
 
-/// A consumer which takes everything it's given and sends it over `done`
-/// when dropped.
+/// A consumer which takes everything it's given, using `read`, and sends it
+/// over `done` when dropped.
 struct Collect<T> {
+    read: ReadFn<T>,
     taken: Vec<T>,
     done: Option<oneshot::Sender<Vec<T>>>,
 }
 
+type ReadFn<T> = fn(&mut Source<'_, T>, StoreContextMut<'_, ()>, &mut Vec<T>) -> Result<()>;
+
+fn read_typed<T: Lift + 'static>(
+    src: &mut Source<'_, T>,
+    store: StoreContextMut<'_, ()>,
+    buf: &mut Vec<T>,
+) -> Result<()> {
+    src.read(store, buf)
+}
+
 impl<T> Collect<T> {
-    fn new() -> (Self, oneshot::Receiver<Vec<T>>) {
+    fn with_read(read: ReadFn<T>) -> (Self, oneshot::Receiver<Vec<T>>) {
         let (tx, rx) = oneshot::channel();
         let consumer = Collect {
+            read,
             taken: Vec::new(),
             done: Some(tx),
         };
         (consumer, rx)
+    }
+
+    fn new() -> (Self, oneshot::Receiver<Vec<T>>)
+    where
+        T: Lift + 'static,
+    {
+        Self::with_read(read_typed::<T>)
+    }
+
+    /// Reads everything `src` has, keeping what was read even if reading
+    /// fails partway through.
+    fn take(&mut self, mut store: StoreContextMut<()>, mut src: Source<'_, T>) -> Result<()>
+    where
+        T: 'static,
+    {
+        let mut buf = Vec::with_capacity(src.remaining(&mut store));
+        let result = (self.read)(&mut src, store, &mut buf);
+        self.taken.extend(buf);
+        result
     }
 }
 
@@ -460,36 +491,32 @@ impl<T> Drop for Collect<T> {
     }
 }
 
-impl<T: Lift + Send + Unpin + 'static> StreamConsumer<()> for Collect<T> {
+impl<T: Send + Unpin + 'static> StreamConsumer<()> for Collect<T> {
     type Item = T;
 
     fn poll_consume(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-        mut store: StoreContextMut<()>,
-        mut src: Source<'_, T>,
+        store: StoreContextMut<()>,
+        src: Source<'_, T>,
         _finish: bool,
     ) -> Poll<Result<StreamResult>> {
-        let mut buf = Vec::with_capacity(src.remaining(&mut store));
-        src.read(&mut store, &mut buf)?;
-        self.taken.extend(buf);
+        self.take(store, src)?;
         Poll::Ready(Ok(StreamResult::Completed))
     }
 }
 
-impl<T: Lift + Send + Unpin + 'static> FutureConsumer<()> for Collect<T> {
+impl<T: Send + Unpin + 'static> FutureConsumer<()> for Collect<T> {
     type Item = T;
 
     fn poll_consume(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-        mut store: StoreContextMut<()>,
-        mut src: Source<'_, T>,
+        store: StoreContextMut<()>,
+        src: Source<'_, T>,
         _finish: bool,
     ) -> Poll<Result<()>> {
-        let mut buf = None;
-        src.read(&mut store, &mut buf)?;
-        self.taken.extend(buf);
+        self.take(store, src)?;
         Poll::Ready(Ok(()))
     }
 }
