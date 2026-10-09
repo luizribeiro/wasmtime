@@ -314,7 +314,7 @@ fn check_guest_buffer(
 }
 
 /// How a host producer's items are lowered into a guest reader's buffer.
-trait LowerItems<T>: 'static {
+pub(super) trait LowerItems<T>: 'static {
     /// Whether lowering may call the guest's `realloc` function.
     const MAY_REQUIRE_REALLOC: bool;
 
@@ -361,6 +361,57 @@ impl<T: func::Lower + Send + 'static> LowerItems<T> for TypedItems {
             count,
             buffer,
         )
+    }
+}
+
+/// Lowers `Val` items with [`Val::store`], which checks each one against the
+/// stream's payload type.
+pub(super) struct ValItems;
+
+impl LowerItems<Val> for ValItems {
+    // Whether a `Val` needs `realloc` depends on its runtime type, so assume
+    // it might.
+    const MAY_REQUIRE_REALLOC: bool = true;
+
+    fn lower<U: 'static, B: WriteBuffer<Val>>(
+        mut store: StoreContextMut<U>,
+        instance: Instance,
+        caller_thread: QualifiedThreadId,
+        options: OptionsIndex,
+        ty: TransmitIndex,
+        address: usize,
+        guest_offset: usize,
+        count: usize,
+        buffer: &mut B,
+    ) -> Result<()> {
+        let count = buffer.remaining().len().min(count);
+        let old_thread = store.0.set_thread(caller_thread)?;
+        let lower = &mut LowerContext::new(store.as_context_mut(), options, instance);
+        let Some(&ty) = ty.payload(lower.types) else {
+            bail_bug!("payload-less streams should have been refused before writing `Val`s")
+        };
+        let abi = lower.types.canonical_abi(&ty);
+        let size = usize::try_from(abi.size32)?;
+        let address = address + size * guest_offset;
+        check_guest_buffer(
+            lower.as_slice_mut(),
+            "read",
+            address,
+            size,
+            abi.align32,
+            count,
+        )?;
+
+        // Remove each item from `buffer` once it is stored so that, if storing
+        // a later one fails, those before it (and any handles they own) are
+        // not stored again.
+        for i in 0..count {
+            buffer.remaining()[0].store(lower, ty, address + size * i)?;
+            buffer.skip(1);
+        }
+
+        store.0.set_thread(old_thread)?;
+        Ok(())
     }
 }
 
@@ -1843,6 +1894,23 @@ pub struct StreamReader<T> {
     _phantom: PhantomData<T>,
 }
 
+/// Creates a stream whose items are written by `producer` and lowered into
+/// guests by `L`.
+pub(super) fn new_host_stream<S, P, L>(mut store: S, producer: P) -> Result<HostResourceIndex>
+where
+    S: AsContextMut,
+    P: StreamProducer<S::Data>,
+    L: LowerItems<P::Item>,
+{
+    ensure!(
+        store.as_context().0.concurrency_support(),
+        "concurrency support is not enabled",
+    );
+    store
+        .as_context_mut()
+        .new_transmit::<_, L>(TransmitKind::Stream, producer)
+}
+
 impl<T> StreamReader<T> {
     /// Create a new stream with the specified producer.
     ///
@@ -1853,21 +1921,15 @@ impl<T> StreamReader<T> {
     ///
     /// [`Config::concurrency_support`]: crate::Config::concurrency_support
     pub fn new<S: AsContextMut>(
-        mut store: S,
+        store: S,
         producer: impl StreamProducer<S::Data, Item = T>,
     ) -> Result<Self>
     where
         T: func::Lower + func::Lift + Send + Sync + 'static,
     {
-        ensure!(
-            store.as_context().0.concurrency_support(),
-            "concurrency support is not enabled",
-        );
-        Ok(Self::new_(
-            store
-                .as_context_mut()
-                .new_transmit::<_, TypedItems>(TransmitKind::Stream, producer)?,
-        ))
+        Ok(Self::new_(new_host_stream::<_, _, TypedItems>(
+            store, producer,
+        )?))
     }
 
     pub(super) fn new_(idx: HostResourceIndex) -> Self {

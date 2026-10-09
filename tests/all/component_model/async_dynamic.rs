@@ -3,8 +3,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 use wasmtime::component::{
-    Component, FutureAny, FutureConsumer, FutureReader, Instance, Lift, Linker, Source, StreamAny,
-    StreamConsumer, StreamReader, StreamResult, TypedFunc, Val,
+    Component, FutureAny, FutureConsumer, FutureReader, Instance, Lift, Linker, Resource,
+    ResourceType, Source, StreamAny, StreamConsumer, StreamReader, StreamResult, Type, TypedFunc,
+    Val, types::StreamType,
 };
 use wasmtime::{Config, Engine, Result, Store, StoreContextMut};
 
@@ -832,5 +833,312 @@ async fn typed_host_stream_refuses_vals() -> Result<()> {
     let err = stream.clone().pipe(&mut store, consumer).unwrap_err();
     assert!(err.to_string().contains("both use `Val` items"), "{err:?}");
     stream.close(&mut store)?;
+    Ok(())
+}
+
+/// Returns a component whose async `forward` export takes a stream of type
+/// `$s`, defined by `types`, and returns a new stream of the same type to
+/// which it copies every item of the first, four at a time.
+fn stream_forwarder(types: &str) -> String {
+    format!(
+        r#"
+(component
+  {types}
+  (core module $libc
+    (memory (export "mem") 1)
+    (global $heap (mut i32) (i32.const 4096))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $ret i32)
+      (local.set $ret
+        (i32.and
+          (i32.add (global.get $heap) (i32.sub (local.get 2) (i32.const 1)))
+          (i32.sub (i32.const 0) (local.get 2))))
+      (global.set $heap (i32.add (local.get $ret) (local.get 3)))
+      (local.get $ret)))
+  (core instance $libc (instantiate $libc))
+  (core func $stream.new (canon stream.new $s))
+  (core func $stream.read
+    (canon stream.read $s async (memory (core memory $libc "mem"))
+      (realloc (core func $libc "realloc"))))
+  (core func $stream.write
+    (canon stream.write $s async (memory (core memory $libc "mem"))))
+  (core func $stream.drop-readable (canon stream.drop-readable $s))
+  (core func $stream.drop-writable (canon stream.drop-writable $s))
+  (core func $task.return (canon task.return (result $s)))
+  (core func $waitable-set.new (canon waitable-set.new))
+  (core func $waitable.join (canon waitable.join))
+  (core module $m
+    (import "" "stream.new" (func $stream.new (result i64)))
+    (import "" "stream.read" (func $stream.read (param i32 i32 i32) (result i32)))
+    (import "" "stream.write" (func $stream.write (param i32 i32 i32) (result i32)))
+    (import "" "stream.drop-readable" (func $stream.drop-readable (param i32)))
+    (import "" "stream.drop-writable" (func $stream.drop-writable (param i32)))
+    (import "" "task.return" (func $task.return (param i32)))
+    (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
+    (import "" "waitable.join" (func $waitable.join (param i32 i32)))
+
+    (global $in (mut i32) (i32.const 0))
+    (global $out (mut i32) (i32.const 0))
+    (global $ws (mut i32) (i32.const 0))
+    ;; Whether `$in` has been dropped by its writer.
+    (global $in-dropped (mut i32) (i32.const 0))
+
+    ;; Waits for `$handle`, returning CALLBACK_CODE_WAIT for `$ws`.
+    (func $wait (param $handle i32) (result i32)
+      (call $waitable.join (local.get $handle) (global.get $ws))
+      (i32.or (i32.const 2) (i32.shl (global.get $ws) (i32.const 4))))
+
+    (func $read (result i32)
+      (local $code i32)
+      (local.set $code
+        (call $stream.read (global.get $in) (i32.const 1024) (i32.const 4)))
+      (if (i32.eq (local.get $code) (i32.const -1))
+        (then (return (call $wait (global.get $in)))))
+      (call $on-read (local.get $code)))
+
+    ;; Writes what a read delivered, or finishes once `$in` is dropped.
+    (func $on-read (param $code i32) (result i32)
+      (local $n i32)
+      (global.set $in-dropped (i32.eq (i32.and (local.get $code) (i32.const 0xf)) (i32.const 1)))
+      (local.set $n (i32.shr_u (local.get $code) (i32.const 4)))
+      (if (i32.eqz (local.get $n))
+        (then (return (call $after-write))))
+      (local.set $code
+        (call $stream.write (global.get $out) (i32.const 1024) (local.get $n)))
+      (if (i32.eq (local.get $code) (i32.const -1))
+        (then (return (call $wait (global.get $out)))))
+      (call $on-write (local.get $code)))
+
+    (func $on-write (param $code i32) (result i32)
+      ;; The host consumer takes everything, so anything else is a bug here.
+      (if (i32.ne (i32.and (local.get $code) (i32.const 0xf)) (i32.const 0))
+        (then unreachable))
+      (call $after-write))
+
+    (func $after-write (result i32)
+      (if (i32.eqz (global.get $in-dropped))
+        (then (return (call $read))))
+      (call $stream.drop-readable (global.get $in))
+      (call $stream.drop-writable (global.get $out))
+      (i32.const 0)) ;; CALLBACK_CODE_EXIT
+
+    (func (export "forward") (param $in i32) (result i32)
+      (local $rw i64)
+      (global.set $in (local.get $in))
+      (local.set $rw (call $stream.new))
+      (global.set $out (i32.wrap_i64 (i64.shr_u (local.get $rw) (i64.const 32))))
+      (global.set $ws (call $waitable-set.new))
+      (call $task.return (i32.wrap_i64 (local.get $rw)))
+      (call $read))
+
+    (func (export "cb") (param $event i32) (param $handle i32) (param $code i32) (result i32)
+      (call $waitable.join (local.get $handle) (i32.const 0))
+      (if (i32.eq (local.get $handle) (global.get $in))
+        (then (return (call $on-read (local.get $code)))))
+      (call $on-write (local.get $code))))
+  (core instance $i (instantiate $m (with "" (instance
+    (export "stream.new" (func $stream.new))
+    (export "stream.read" (func $stream.read))
+    (export "stream.write" (func $stream.write))
+    (export "stream.drop-readable" (func $stream.drop-readable))
+    (export "stream.drop-writable" (func $stream.drop-writable))
+    (export "task.return" (func $task.return))
+    (export "waitable-set.new" (func $waitable-set.new))
+    (export "waitable.join" (func $waitable.join))))))
+  (func (export "forward") async (param "s" $s) (result $s)
+    (canon lift (core func $i "forward") async (callback (core func $i "cb"))))
+)
+"#
+    )
+}
+
+/// A host resource type which `stream_forwarder` components may import as
+/// `r`.
+struct HostThing;
+
+/// Instantiates `stream_forwarder(types)`, returning its store, the type of
+/// stream it forwards, and its `forward` export.
+async fn forwarder(
+    types: &str,
+) -> Result<(Store<()>, StreamType, TypedFunc<(StreamAny,), (StreamAny,)>)> {
+    let mut config = Config::new();
+    config.wasm_component_model_async(true);
+    let engine = Engine::new(&config)?;
+    let component = Component::new(&engine, stream_forwarder(types))?;
+    let mut store = Store::new(&engine, ());
+    let mut linker = Linker::new(&engine);
+    linker
+        .root()
+        .resource("r", ResourceType::host::<HostThing>(), |_, _| Ok(()))?;
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let func = instance.get_func(&mut store, "forward").unwrap();
+    let Type::Stream(ty) = func.ty(&store).params().next().unwrap().1 else {
+        unreachable!()
+    };
+    let forward = func.typed::<(StreamAny,), (StreamAny,)>(&store)?;
+    Ok((store, ty, forward))
+}
+
+/// Writes `items` to a new `Val` stream of type `ty`, passes it to `forward`,
+/// and reads what comes back as `Val`s.
+async fn forward_vals(
+    store: &mut Store<()>,
+    ty: StreamType,
+    forward: &TypedFunc<(StreamAny,), (StreamAny,)>,
+    items: Vec<Val>,
+) -> Result<Vec<Val>> {
+    let stream = StreamAny::new(&mut *store, ty, items)?;
+    let (stream,) = forward.call_async(&mut *store, (stream,)).await?;
+    let (consumer, done) = Collect::vals();
+    stream.pipe(&mut *store, consumer)?;
+    Ok(store.run_concurrent(async |_| done.await).await??)
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn val_stream_round_trips_through_guest() -> Result<()> {
+    let string = |s: &str| Val::String(s.into());
+    let cases = [
+        ("(type $s (stream u32))", (1..=6).map(Val::U32).collect()),
+        (
+            "(type $s (stream string))",
+            vec![
+                string("a"),
+                string(""),
+                string("long enough to need realloc"),
+            ],
+        ),
+        (
+            r#"(type $r (record (field "a" u32) (field "b" string)))
+               (export $r' "r" (type $r))
+               (type $s (stream $r'))"#,
+            vec![
+                record(&[("a", Val::U32(1)), ("b", string("x"))]),
+                record(&[("a", Val::U32(2)), ("b", string("yz"))]),
+            ],
+        ),
+        (
+            "(type $s (stream (option string)))",
+            vec![Val::Option(Some(Box::new(string("x")))), Val::Option(None)],
+        ),
+        (
+            r#"(type $v (variant (case "a" u8) (case "b" string) (case "c")))
+               (export $v' "v" (type $v))
+               (type $s (stream $v'))"#,
+            vec![
+                Val::Variant("b".into(), Some(Box::new(string("x")))),
+                Val::Variant("a".into(), Some(Box::new(Val::U8(3)))),
+                Val::Variant("c".into(), None),
+            ],
+        ),
+        (
+            "(type $s (stream (list u16)))",
+            vec![Val::List(vec![Val::U16(1), Val::U16(2)]), Val::List(vec![])],
+        ),
+    ];
+    for (types, items) in cases {
+        let (mut store, ty, forward) = forwarder(types).await?;
+        assert_eq!(
+            forward_vals(&mut store, ty, &forward, items.clone()).await?,
+            items,
+            "{types}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn val_stream_moves_resources_through_guest() -> Result<()> {
+    let (mut store, ty, forward) = forwarder(
+        r#"(import "r" (type $r (sub resource)))
+           (type $s (stream (own $r)))"#,
+    )
+    .await?;
+    let items = [7, 8]
+        .into_iter()
+        .map(|rep| {
+            let r = Resource::<HostThing>::new_own(rep).try_into_resource_any(&mut store)?;
+            Ok(Val::Resource(r))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut reps = Vec::new();
+    for item in forward_vals(&mut store, ty, &forward, items).await? {
+        let Val::Resource(r) = item else {
+            panic!("expected a resource, found {item:?}")
+        };
+        reps.push(r.try_into_resource::<HostThing>(&mut store)?.rep());
+    }
+    assert_eq!(reps, [7, 8]);
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn val_stream_items_are_typechecked_when_lowered() -> Result<()> {
+    let (mut store, ty, forward) = forwarder("(type $s (stream u32))").await?;
+    let items = vec![Val::U32(1), Val::String("not a u32".into())];
+    let err = forward_vals(&mut store, ty, &forward, items)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("type mismatch: expected u32, found string"),
+        "{err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn val_stream_read_host_to_host() -> Result<()> {
+    let (mut store, ty, _) = forwarder("(type $s (stream string))").await?;
+    let items = vec![Val::String("a".into()), Val::String("b".into())];
+    let stream = StreamAny::new(&mut store, ty.clone(), items.clone())?;
+    assert_eq!(stream.ty(), Some(ty));
+    let (consumer, done) = Collect::vals();
+    stream.pipe(&mut store, consumer)?;
+    assert_eq!(store.run_concurrent(async |_| done.await).await??, items);
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn val_stream_refuses_typed_consumer() -> Result<()> {
+    let (mut store, ty, _) = forwarder("(type $s (stream u32))").await?;
+    let mut stream = StreamAny::new(&mut store, ty, vec![Val::U32(1)])?;
+    let reader = stream.clone().try_into_stream_reader::<u32>()?;
+    let err = reader
+        .pipe(&mut store, Collect::<u32>::new().0)
+        .unwrap_err();
+    assert!(err.to_string().contains("both use `Val` items"), "{err:?}");
+    stream.close(&mut store)?;
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn payload_less_val_stream_refused() -> Result<()> {
+    let (mut store, ty, _) = forwarder("(type $s (stream))").await?;
+    let err = StreamAny::new(&mut store, ty, Vec::<Val>::new()).unwrap_err();
+    assert!(err.to_string().contains("payload-less"), "{err:?}");
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn val_stream_lowering_failure_keeps_moved_resources_moved() -> Result<()> {
+    let (mut store, ty, forward) = forwarder(
+        r#"(import "r" (type $r (sub resource)))
+           (type $s (stream (own $r)))"#,
+    )
+    .await?;
+    let sent = Resource::<HostThing>::new_own(7).try_into_resource_any(&mut store)?;
+    let kept = Resource::<HostThing>::new_own(8).try_into_resource_any(&mut store)?;
+    let items = vec![Val::Resource(sent), Val::String("not a resource".into())];
+    assert!(forward_vals(&mut store, ty, &forward, items).await.is_err());
+
+    // The first item was moved into the guest before the second failed.
+    assert!(sent.try_into_resource::<HostThing>(&mut store).is_err());
+    assert_eq!(kept.try_into_resource::<HostThing>(&mut store)?.rep(), 8);
     Ok(())
 }

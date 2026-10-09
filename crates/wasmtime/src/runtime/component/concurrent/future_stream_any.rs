@@ -1,16 +1,16 @@
 //! Implementation of [`FutureAny`] and [`StreamAny`].
 
-use crate::component::concurrent::futures_and_streams::{self, TransmitOrigin};
+use crate::component::concurrent::futures_and_streams::{self, TransmitOrigin, ValItems};
 use crate::component::func::{LiftContext, LowerContext, bad_type_info, desc};
 use crate::component::matching::InstanceType;
 use crate::component::resources::HostResourceIndex;
 use crate::component::types::{self, FutureType, StreamType};
 use crate::component::{
-    ComponentInstanceId, ComponentType, FutureReader, Lift, Lower, StreamConsumer, StreamReader,
-    Val,
+    ComponentInstanceId, ComponentType, FutureReader, Lift, Lower, StreamConsumer, StreamProducer,
+    StreamReader, Val,
 };
 use crate::store::StoreOpaque;
-use crate::{AsContextMut, Result, bail, error::Context};
+use crate::{AsContextMut, Result, bail, ensure, error::Context};
 use core::any::TypeId;
 use core::mem::MaybeUninit;
 use wasmtime_environ::component::{
@@ -231,6 +231,40 @@ pub struct StreamAny {
 }
 
 impl StreamAny {
+    /// Create a new stream of type `ty` whose items are written by `producer`
+    /// as [`Val`]s.
+    ///
+    /// This is the dynamically typed counterpart of [`StreamReader::new`].
+    /// Items are not checked against `ty` until they are lowered into a
+    /// guest, which happens one item at a time with the same rules as
+    /// arguments to [`Func::call`](crate::component::Func::call); an item of
+    /// the wrong type then fails that read. Items passed to a host consumer
+    /// with [`StreamAny::pipe`] are moved as they are, without being checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `ty` has no payload type (`stream` rather than
+    /// `stream<T>`), if the resource table for this store is full, or if
+    /// [`Config::concurrency_support`] is not enabled.
+    ///
+    /// [`Config::concurrency_support`]: crate::Config::concurrency_support
+    pub fn new<S: AsContextMut>(
+        store: S,
+        ty: StreamType,
+        producer: impl StreamProducer<S::Data, Item = Val>,
+    ) -> Result<Self> {
+        ensure!(
+            ty.ty().is_some(),
+            "payload-less streams have no `Val` items to write"
+        );
+        Ok(StreamAny {
+            idx: futures_and_streams::new_host_stream::<_, _, ValItems>(store, producer)?,
+            // The component model type is known exactly, as it is for streams
+            // created by guests.
+            ty: PayloadType::Guest(ty),
+        })
+    }
+
     fn lower_to_index<T>(&self, cx: &mut LowerContext<'_, T>, ty: InterfaceType) -> Result<u32> {
         // See comments in `FutureAny::lower_to_index` for why this is
         // different from `StreamReader`'s implementation.
