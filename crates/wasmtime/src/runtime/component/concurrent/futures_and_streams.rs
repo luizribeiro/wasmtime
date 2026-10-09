@@ -1521,6 +1521,108 @@ pub struct FutureReader<T> {
     _phantom: PhantomData<T>,
 }
 
+/// Adapts a [`FutureProducer`] into a [`StreamProducer`].
+struct FutureAsStreamProducer<P>(P);
+
+impl<D, T, P> StreamProducer<D> for FutureAsStreamProducer<P>
+where
+    T: Send + Sync + 'static,
+    P: FutureProducer<D, Item = T>,
+{
+    type Item = P::Item;
+    type Buffer = Option<P::Item>;
+
+    fn poll_produce<'a>(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<D>,
+        mut destination: Destination<'a, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<Result<StreamResult>> {
+        // SAFETY: This is a standard pin-projection, and we never move
+        // out of `self`.
+        let producer = unsafe { self.map_unchecked_mut(|v| &mut v.0) };
+
+        Poll::Ready(Ok(
+            if let Some(value) = ready!(producer.poll_produce(cx, store, finish))? {
+                destination.set_buffer(Some(value));
+
+                // Here we return `StreamResult::Completed` even though
+                // we've produced the last item we'll ever produce.
+                // That's because the ABI expects
+                // `ReturnCode::Completed(1)` rather than
+                // `ReturnCode::Dropped(1)`.  In any case, we won't be
+                // called again since the future will have resolved.
+                StreamResult::Completed
+            } else {
+                StreamResult::Cancelled
+            },
+        ))
+    }
+}
+
+/// Adapts a [`FutureConsumer`] into a [`StreamConsumer`].
+struct FutureAsStreamConsumer<C>(C);
+
+impl<D: 'static, T: 'static, C: FutureConsumer<D, Item = T>> StreamConsumer<D>
+    for FutureAsStreamConsumer<C>
+{
+    type Item = T;
+
+    fn poll_consume(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut store: StoreContextMut<D>,
+        mut source: Source<Self::Item>,
+        finish: bool,
+    ) -> Poll<Result<StreamResult>> {
+        // SAFETY: This is a standard pin-projection, and we never move
+        // out of `self`.
+        let consumer = unsafe { self.map_unchecked_mut(|v| &mut v.0) };
+
+        ready!(consumer.poll_consume(cx, store.as_context_mut(), source.reborrow(), finish))?;
+
+        Poll::Ready(Ok(if source.remaining(store) == 0 {
+            // Here we return `StreamResult::Completed` even though
+            // we've consumed the last item we'll ever consume.  That's
+            // because the ABI expects `ReturnCode::Completed(1)` rather
+            // than `ReturnCode::Dropped(1)`.  In any case, we won't be
+            // called again since the future will have resolved.
+            StreamResult::Completed
+        } else {
+            StreamResult::Cancelled
+        }))
+    }
+}
+
+/// Creates a future whose value is written by `producer` and lowered into
+/// guests by `L`.
+pub(super) fn new_host_future<S, P, L>(mut store: S, producer: P) -> Result<HostResourceIndex>
+where
+    S: AsContextMut,
+    P: FutureProducer<S::Data, Item: Send + Sync>,
+    L: LowerItems<P::Item>,
+{
+    ensure!(
+        store.as_context().0.concurrency_support(),
+        "concurrency support is not enabled"
+    );
+    store
+        .as_context_mut()
+        .new_transmit::<_, L>(TransmitKind::Future, FutureAsStreamProducer(producer))
+}
+
+/// Sets `consumer` as the consumer of the future read by `idx`.
+pub(super) fn pipe_future<S, C>(mut store: S, idx: HostResourceIndex, consumer: C) -> Result<()>
+where
+    S: AsContextMut,
+    C: FutureConsumer<S::Data, Item: 'static>,
+{
+    store
+        .as_context_mut()
+        .set_consumer(idx, TransmitKind::Future, FutureAsStreamConsumer(consumer))
+}
+
 impl<T> FutureReader<T> {
     /// Create a new future with the specified producer.
     ///
@@ -1531,59 +1633,15 @@ impl<T> FutureReader<T> {
     ///
     /// [`Config::concurrency_support`]: crate::Config::concurrency_support
     pub fn new<S: AsContextMut>(
-        mut store: S,
+        store: S,
         producer: impl FutureProducer<S::Data, Item = T>,
     ) -> Result<Self>
     where
         T: func::Lower + func::Lift + Send + Sync + 'static,
     {
-        ensure!(
-            store.as_context().0.concurrency_support(),
-            "concurrency support is not enabled"
-        );
-
-        struct Producer<P>(P);
-
-        impl<D, T: func::Lower + 'static, P: FutureProducer<D, Item = T>> StreamProducer<D>
-            for Producer<P>
-        {
-            type Item = P::Item;
-            type Buffer = Option<P::Item>;
-
-            fn poll_produce<'a>(
-                self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-                store: StoreContextMut<D>,
-                mut destination: Destination<'a, Self::Item, Self::Buffer>,
-                finish: bool,
-            ) -> Poll<Result<StreamResult>> {
-                // SAFETY: This is a standard pin-projection, and we never move
-                // out of `self`.
-                let producer = unsafe { self.map_unchecked_mut(|v| &mut v.0) };
-
-                Poll::Ready(Ok(
-                    if let Some(value) = ready!(producer.poll_produce(cx, store, finish))? {
-                        destination.set_buffer(Some(value));
-
-                        // Here we return `StreamResult::Completed` even though
-                        // we've produced the last item we'll ever produce.
-                        // That's because the ABI expects
-                        // `ReturnCode::Completed(1)` rather than
-                        // `ReturnCode::Dropped(1)`.  In any case, we won't be
-                        // called again since the future will have resolved.
-                        StreamResult::Completed
-                    } else {
-                        StreamResult::Cancelled
-                    },
-                ))
-            }
-        }
-
-        Ok(Self::new_(
-            store
-                .as_context_mut()
-                .new_transmit::<_, TypedItems>(TransmitKind::Future, Producer(producer))?,
-        ))
+        Ok(Self::new_(new_host_future::<_, _, TypedItems>(
+            store, producer,
+        )?))
     }
 
     pub(super) fn new_(idx: HostResourceIndex) -> Self {
@@ -1606,53 +1664,13 @@ impl<T> FutureReader<T> {
     /// `store`.
     pub fn pipe<S: AsContextMut>(
         self,
-        mut store: S,
+        store: S,
         consumer: impl FutureConsumer<S::Data, Item = T> + Unpin,
     ) -> Result<()>
     where
         T: func::Lift + 'static,
     {
-        struct Consumer<C>(C);
-
-        impl<D: 'static, T: func::Lift + 'static, C: FutureConsumer<D, Item = T>> StreamConsumer<D>
-            for Consumer<C>
-        {
-            type Item = T;
-
-            fn poll_consume(
-                self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-                mut store: StoreContextMut<D>,
-                mut source: Source<Self::Item>,
-                finish: bool,
-            ) -> Poll<Result<StreamResult>> {
-                // SAFETY: This is a standard pin-projection, and we never move
-                // out of `self`.
-                let consumer = unsafe { self.map_unchecked_mut(|v| &mut v.0) };
-
-                ready!(consumer.poll_consume(
-                    cx,
-                    store.as_context_mut(),
-                    source.reborrow(),
-                    finish
-                ))?;
-
-                Poll::Ready(Ok(if source.remaining(store) == 0 {
-                    // Here we return `StreamResult::Completed` even though
-                    // we've consumed the last item we'll ever consume.  That's
-                    // because the ABI expects `ReturnCode::Completed(1)` rather
-                    // than `ReturnCode::Dropped(1)`.  In any case, we won't be
-                    // called again since the future will have resolved.
-                    StreamResult::Completed
-                } else {
-                    StreamResult::Cancelled
-                }))
-            }
-        }
-
-        store
-            .as_context_mut()
-            .set_consumer(self.idx, TransmitKind::Future, Consumer(consumer))
+        pipe_future(store, self.idx, consumer)
     }
 
     /// Transfer ownership of the read end of a future from a guest to the host.
