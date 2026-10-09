@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 use wasmtime::component::{
     Component, FutureAny, FutureConsumer, FutureReader, Instance, Lift, Linker, Source, StreamAny,
-    StreamConsumer, StreamReader, StreamResult, Val,
+    StreamConsumer, StreamReader, StreamResult, TypedFunc, Val,
 };
 use wasmtime::{Config, Engine, Result, Store, StoreContextMut};
 
@@ -454,6 +454,14 @@ fn read_typed<T: Lift + 'static>(
     src.read(store, buf)
 }
 
+fn read_vals(
+    src: &mut Source<'_, Val>,
+    store: StoreContextMut<'_, ()>,
+    buf: &mut Vec<Val>,
+) -> Result<()> {
+    src.read_vals(store, buf)
+}
+
 impl<T> Collect<T> {
     fn with_read(read: ReadFn<T>) -> (Self, oneshot::Receiver<Vec<T>>) {
         let (tx, rx) = oneshot::channel();
@@ -482,6 +490,12 @@ impl<T> Collect<T> {
         let result = (self.read)(&mut src, store, &mut buf);
         self.taken.extend(buf);
         result
+    }
+}
+
+impl Collect<Val> {
+    fn vals() -> (Self, oneshot::Receiver<Vec<Val>>) {
+        Self::with_read(read_vals)
     }
 }
 
@@ -606,5 +620,217 @@ async fn host_future_read_as_other_rust_type() -> Result<()> {
         .await
         .unwrap_err();
     assert_type_mismatch(&err);
+    Ok(())
+}
+
+/// Returns a component whose `new` export creates a stream of type `$s`,
+/// defined by `types` (e.g. `(type $s (stream u32))`), whose `write` export
+/// writes the first `n` items encoded at address 100 by `data`, and whose
+/// `close` export drops the writable end.
+fn stream_writer(types: &str, data: &str) -> String {
+    format!(
+        r#"
+(component
+  {types}
+  (core module $libc (memory (export "mem") 1))
+  (core instance $libc (instantiate $libc))
+  (core func $stream.new (canon stream.new $s))
+  (core func $stream.write
+    (canon stream.write $s async (memory (core memory $libc "mem"))))
+  (core func $stream.drop-writable (canon stream.drop-writable $s))
+  (core module $m
+    (import "" "mem" (memory 1))
+    (import "" "stream.new" (func $stream.new (result i64)))
+    (import "" "stream.write"
+      (func $stream.write (param i32 i32 i32) (result i32)))
+    (import "" "stream.drop-writable" (func $stream.drop-writable (param i32)))
+
+    (global $w (mut i32) (i32.const 0))
+    {data}
+
+    (func (export "new") (result i32)
+      (local $rw i64)
+      (local.set $rw (call $stream.new))
+      (global.set $w (i32.wrap_i64 (i64.shr_u (local.get $rw) (i64.const 32))))
+      (i32.wrap_i64 (local.get $rw)))
+    (func (export "write") (param $n i32) (result i32)
+      (call $stream.write (global.get $w) (i32.const 100) (local.get $n)))
+    (func (export "close")
+      (call $stream.drop-writable (global.get $w))))
+  (core instance $i (instantiate $m (with "" (instance
+    (export "mem" (memory $libc "mem"))
+    (export "stream.new" (func $stream.new))
+    (export "stream.write" (func $stream.write))
+    (export "stream.drop-writable" (func $stream.drop-writable))))))
+  (func (export "new") (result $s) (canon lift (core func $i "new")))
+  (func (export "write") (param "n" u32) (result u32)
+    (canon lift (core func $i "write")))
+  (func (export "close") (canon lift (core func $i "close")))
+)
+"#
+    )
+}
+
+struct StreamWriter {
+    store: Store<()>,
+    stream: StreamAny,
+    write: TypedFunc<(u32,), (u32,)>,
+    close: TypedFunc<(), ()>,
+}
+
+impl StreamWriter {
+    async fn new(types: &str, data: &str) -> Result<Self> {
+        let mut config = Config::new();
+        config.wasm_component_model_async(true);
+        let engine = Engine::new(&config)?;
+        let component = Component::new(&engine, stream_writer(types, data))?;
+        let mut store = Store::new(&engine, ());
+        let instance = Linker::new(&engine)
+            .instantiate_async(&mut store, &component)
+            .await?;
+        let new = instance.get_typed_func::<(), (StreamAny,)>(&mut store, "new")?;
+        let write = instance.get_typed_func::<(u32,), (u32,)>(&mut store, "write")?;
+        let close = instance.get_typed_func::<(), ()>(&mut store, "close")?;
+        let (stream,) = new.call_async(&mut store, ()).await?;
+        Ok(StreamWriter {
+            store,
+            stream,
+            write,
+            close,
+        })
+    }
+
+    /// Pipes the stream into a `Val` consumer, has the guest write `n` items
+    /// and close the stream, and returns what the consumer took.
+    async fn read_vals(mut self, n: u32) -> Result<Vec<Val>> {
+        let (consumer, done) = Collect::vals();
+        self.stream.pipe(&mut self.store, consumer)?;
+        let (code,) = self.write.call_async(&mut self.store, (n,)).await?;
+        assert_eq!(code, n << 4); // COMPLETED(n)
+        self.close.call_async(&mut self.store, ()).await?;
+        Ok(self.store.run_concurrent(async |_| done.await).await??)
+    }
+}
+
+fn record(fields: &[(&str, Val)]) -> Val {
+    Val::Record(
+        fields
+            .iter()
+            .map(|(name, val)| (name.to_string(), val.clone()))
+            .collect(),
+    )
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn guest_stream_read_as_vals() -> Result<()> {
+    // Strings and lists below point at "abc" stored at address 200.
+    let abc = r#"(data (i32.const 200) "abc")"#;
+    let cases = [
+        (
+            "(type $s (stream u32))".to_string(),
+            r#"(data (i32.const 100) "\01\00\00\00\02\00\00\00")"#.to_string(),
+            vec![Val::U32(1), Val::U32(2)],
+        ),
+        (
+            "(type $s (stream string))".to_string(),
+            format!(
+                r#"(data (i32.const 100) "\c8\00\00\00\02\00\00\00\ca\00\00\00\01\00\00\00") {abc}"#
+            ),
+            vec![Val::String("ab".into()), Val::String("c".into())],
+        ),
+        (
+            r#"(type $r (record (field "a" u32) (field "b" string)))
+               (export $r' "r" (type $r))
+               (type $s (stream $r'))"#
+                .to_string(),
+            format!(r#"(data (i32.const 100) "\07\00\00\00\c8\00\00\00\03\00\00\00") {abc}"#),
+            vec![record(&[
+                ("a", Val::U32(7)),
+                ("b", Val::String("abc".into())),
+            ])],
+        ),
+        (
+            "(type $s (stream (option u32)))".to_string(),
+            r#"(data (i32.const 100) "\01\00\00\00\05\00\00\00\00\00\00\00\00\00\00\00")"#
+                .to_string(),
+            vec![Val::Option(Some(Box::new(Val::U32(5)))), Val::Option(None)],
+        ),
+        (
+            "(type $s (stream (list u8)))".to_string(),
+            format!(r#"(data (i32.const 100) "\c8\00\00\00\03\00\00\00") {abc}"#),
+            vec![Val::List(vec![Val::U8(b'a'), Val::U8(b'b'), Val::U8(b'c')])],
+        ),
+    ];
+    for (types, data, expected) in cases {
+        let writer = StreamWriter::new(&types, &data).await?;
+        assert!(writer.stream.ty().unwrap().ty().is_some());
+        let n = u32::try_from(expected.len())?;
+        assert_eq!(writer.read_vals(n).await?, expected, "{types}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn guest_stream_read_vals_stops_at_invalid_item() -> Result<()> {
+    // The second string is not valid UTF-8.
+    let data = r#"(data (i32.const 100) "\c8\00\00\00\01\00\00\00\c9\00\00\00\01\00\00\00")
+                  (data (i32.const 200) "a\ff")"#;
+    let mut writer = StreamWriter::new("(type $s (stream string))", data).await?;
+    let (consumer, done) = Collect::vals();
+    writer.stream.pipe(&mut writer.store, consumer)?;
+    assert!(
+        writer
+            .write
+            .call_async(&mut writer.store, (2,))
+            .await
+            .is_err()
+    );
+    drop(writer.store);
+    assert_eq!(done.await?, [Val::String("a".into())]);
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn payload_less_guest_stream_refuses_vals() -> Result<()> {
+    let mut writer = StreamWriter::new("(type $s (stream))", "").await?;
+    assert!(writer.stream.ty().unwrap().ty().is_none());
+    let (consumer, _done) = Collect::vals();
+    let err = writer
+        .stream
+        .clone()
+        .pipe(&mut writer.store, consumer)
+        .unwrap_err();
+    assert!(err.to_string().contains("payload-less"), "{err:?}");
+    writer.stream.close(&mut writer.store)?;
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn typed_host_stream_refuses_vals() -> Result<()> {
+    let (mut store, instance) = instantiate_echo().await?;
+
+    let mut stream =
+        StreamReader::new(&mut store, vec!["a".to_string()])?.try_into_stream_any(&mut store)?;
+    assert!(stream.ty().is_none());
+    let (consumer, _done) = Collect::vals();
+    let err = stream.clone().pipe(&mut store, consumer).unwrap_err();
+    assert!(err.to_string().contains("both use `Val` items"), "{err:?}");
+    stream.close(&mut store)?;
+
+    // Still refused after passing through a guest, which gives it a
+    // component model type.
+    let echo =
+        instance.get_typed_func::<(StreamReader<String>,), (StreamAny,)>(&mut store, "echo-s")?;
+    let reader = StreamReader::new(&mut store, vec!["a".to_string()])?;
+    let (mut stream,) = echo.call_async(&mut store, (reader,)).await?;
+    assert!(stream.ty().is_some());
+    let (consumer, _done) = Collect::vals();
+    let err = stream.clone().pipe(&mut store, consumer).unwrap_err();
+    assert!(err.to_string().contains("both use `Val` items"), "{err:?}");
+    stream.close(&mut store)?;
     Ok(())
 }

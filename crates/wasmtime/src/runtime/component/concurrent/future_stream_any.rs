@@ -6,7 +6,8 @@ use crate::component::matching::InstanceType;
 use crate::component::resources::HostResourceIndex;
 use crate::component::types::{self, FutureType, StreamType};
 use crate::component::{
-    ComponentInstanceId, ComponentType, FutureReader, Lift, Lower, StreamReader,
+    ComponentInstanceId, ComponentType, FutureReader, Lift, Lower, StreamConsumer, StreamReader,
+    Val,
 };
 use crate::store::StoreOpaque;
 use crate::{AsContextMut, Result, bail, error::Context};
@@ -101,7 +102,7 @@ impl FutureAny {
     {
         let store = store.as_context_mut();
         let ty = match store.0.transmit_origin(reader.idx())? {
-            TransmitOrigin::Host => PayloadType::new_host::<T>(),
+            TransmitOrigin::Host { .. } => PayloadType::new_host::<T>(),
             TransmitOrigin::GuestFuture(id, ty) => PayloadType::new_guest_future(store.0, id, ty),
             TransmitOrigin::GuestStream(..) => bail!("not a future"),
         };
@@ -262,6 +263,53 @@ impl StreamAny {
         Ok(StreamReader::new_(self.idx))
     }
 
+    /// Returns the component model type of this stream, if known.
+    ///
+    /// This is `None` for a stream created by the host with a statically typed
+    /// producer, such as [`StreamReader::new`], which was then converted with
+    /// [`StreamAny::try_from_stream_reader`] without passing through a guest.
+    /// Such streams have only a Rust type, not a component model type.
+    pub fn ty(&self) -> Option<StreamType> {
+        match &self.ty {
+            PayloadType::Guest(ty) => Some(ty.clone()),
+            PayloadType::Host { .. } => None,
+        }
+    }
+
+    /// Set the consumer that accepts the items delivered to this stream as
+    /// [`Val`]s.
+    ///
+    /// This is the dynamically typed counterpart of [`StreamReader::pipe`].
+    /// The consumer reads items with [`Source::read_vals`], and each item is a
+    /// [`Val`] of the payload type reported by [`StreamAny::ty`].
+    ///
+    /// [`Source::read_vals`]: crate::component::Source::read_vals
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// * this stream has no payload type (`stream` rather than `stream<T>`),
+    /// * this stream was created by the host with a statically typed
+    ///   producer, which must be read with a statically typed consumer,
+    /// * this stream has already been closed or otherwise transferred (e.g.
+    ///   lowered into a guest), or does not belong to `store`.
+    ///
+    /// In the first two cases the stream is left open, so a clone of this
+    /// [`StreamAny`] can still be used to close it.
+    pub fn pipe<S: AsContextMut>(
+        self,
+        store: S,
+        consumer: impl StreamConsumer<S::Data, Item = Val>,
+    ) -> Result<()> {
+        if let PayloadType::Guest(ty) = &self.ty
+            && ty.ty().is_none()
+        {
+            bail!("payload-less streams have no `Val` items to read");
+        }
+        StreamReader::<Val>::new_(self.idx).pipe(store, consumer)
+    }
+
     /// Attempts to convert `reader` to a [`StreamAny`], erasing its statically
     /// known type.
     ///
@@ -278,7 +326,7 @@ impl StreamAny {
     {
         let store = store.as_context_mut();
         let ty = match store.0.transmit_origin(reader.idx())? {
-            TransmitOrigin::Host => PayloadType::new_host::<T>(),
+            TransmitOrigin::Host { .. } => PayloadType::new_host::<T>(),
             TransmitOrigin::GuestStream(id, ty) => PayloadType::new_guest_stream(store.0, id, ty),
             TransmitOrigin::GuestFuture(..) => bail!("not a stream"),
         };

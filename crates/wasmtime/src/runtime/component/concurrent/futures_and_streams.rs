@@ -321,6 +321,59 @@ fn lift<T: func::Lift + Send + 'static, B: ReadBuffer<T>>(
     Ok(())
 }
 
+/// Lifts up to `count` items of type `ty` at `address` into `buffer` as
+/// `Val`s, skipping the first `guest_offset` items.
+///
+/// Items are moved into `buffer` one at a time so that, if lifting one fails,
+/// those before it (and any handles they own) have already been handed over.
+fn lift_vals<B: ReadBuffer<Val>>(
+    cx: &mut LiftContext<'_>,
+    ty: Option<InterfaceType>,
+    buffer: &mut B,
+    address: usize,
+    guest_offset: usize,
+    count: usize,
+) -> Result<()> {
+    let Some(ty) = ty else {
+        bail_bug!("payload-less streams should have been refused before reading `Val`s")
+    };
+    let abi = cx.types.canonical_abi(&ty);
+    let size = usize::try_from(abi.size32)?;
+    let address = address + size * guest_offset;
+    let count = count.min(buffer.remaining_capacity());
+    if address % usize::try_from(abi.align32)? != 0 {
+        bail!("write pointer not aligned");
+    }
+    cx.memory()
+        .get(address..)
+        .and_then(|b| b.get(..size * count))
+        .ok_or_else(|| crate::format_err!("write pointer out of bounds of memory"))?;
+
+    for i in 0..count {
+        let val = Val::load(cx, ty, &cx.memory()[address + size * i..][..size])?;
+        buffer.extend(iter::once(val));
+    }
+    Ok(())
+}
+
+/// Returns an error if a host producer of `item`s is being read by a host
+/// consumer of `C` items where exactly one of them uses `Val`.
+///
+/// Mismatches between two statically typed items are caught later, when
+/// items are first handed over, which keeps streams that never produce
+/// anything working as before.
+fn ensure_val_items_match<C: 'static>(item: TypeId) -> Result<()> {
+    let consumer = TypeId::of::<C>();
+    let val = TypeId::of::<Val>();
+    if item != consumer && (item == val || consumer == val) {
+        bail!(
+            "host producer and host consumer must both use `Val` items or both use \
+             statically typed items"
+        );
+    }
+    Ok(())
+}
+
 /// Represents the state associated with an error context
 #[derive(Debug, PartialEq, Eq, PartialOrd)]
 pub(super) struct ErrorContextState {
@@ -884,9 +937,37 @@ impl<'a, T> Source<'a, T> {
     }
 
     /// Accept zero or more items from the writer.
-    pub fn read<B, S: AsContextMut>(&mut self, mut store: S, buffer: &mut B) -> Result<()>
+    pub fn read<B, S: AsContextMut>(&mut self, store: S, buffer: &mut B) -> Result<()>
     where
         T: func::Lift + 'static,
+        B: ReadBuffer<T>,
+    {
+        self.read_with(
+            store,
+            buffer,
+            |cx, ty, buffer, address, guest_offset, count| {
+                lift::<T, B>(cx, ty, buffer, address + (T::SIZE32 * guest_offset), count)
+            },
+        )
+    }
+
+    /// Moves items from a host writer into `buffer`, or calls `lift` with the
+    /// remaining items of a guest writer and records how many it took.
+    fn read_with<B, S: AsContextMut>(
+        &mut self,
+        mut store: S,
+        buffer: &mut B,
+        lift_items: impl FnOnce(
+            &mut LiftContext<'_>,
+            Option<InterfaceType>,
+            &mut B,
+            usize,
+            usize,
+            usize,
+        ) -> Result<()>,
+    ) -> Result<()>
+    where
+        T: 'static,
         B: ReadBuffer<T>,
     {
         if let Some(input) = &mut self.host_buffer {
@@ -915,13 +996,14 @@ impl<'a, T> Source<'a, T> {
             let cx = &mut LiftContext::new(store.0.store_opaque_mut(), options, instance)?;
             let ty = ty.payload(cx.types);
             let old_remaining = buffer.remaining_capacity();
-            lift::<T, B>(
+            let lifted = lift_items(
                 cx,
                 ty.copied(),
                 buffer,
-                address + (T::SIZE32 * guest_offset.as_usize()),
+                address,
+                guest_offset.as_usize(),
                 count.as_usize() - guest_offset.as_usize(),
-            )?;
+            );
 
             let transmit = store.0.concurrent_state_mut()?.get_mut(self.id)?;
 
@@ -929,7 +1011,11 @@ impl<'a, T> Source<'a, T> {
                 bail_bug!("expected ReadState::HostReady");
             };
 
+            // Record the items that were moved into `buffer` even if lifting a
+            // later one failed: they, and any handles they own, now belong to
+            // the consumer, so they must not be lifted again.
             guest_offset.inc(old_remaining - buffer.remaining_capacity())?;
+            lifted?;
         }
 
         Ok(())
@@ -964,6 +1050,27 @@ impl<'a, T> Source<'a, T> {
         } else {
             bail_bug!("expected either WriteState::GuestReady or host buffer")
         }
+    }
+}
+
+impl Source<'_, Val> {
+    /// Accept zero or more dynamically typed items from the writer.
+    ///
+    /// This is the counterpart of [`Source::read`] for consumers passed to
+    /// [`StreamAny::pipe`]. Items written by a guest are lifted one at a time,
+    /// each as a [`Val`] of the stream's payload type, so this costs more per
+    /// item than reading statically typed items.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an item cannot be lifted, for example because the
+    /// guest wrote an invalid string. Items before it have already been moved
+    /// into `buffer`.
+    pub fn read_vals<B, S: AsContextMut>(&mut self, store: S, buffer: &mut B) -> Result<()>
+    where
+        B: ReadBuffer<Val>,
+    {
+        self.read_with(store, buffer, lift_vals)
     }
 }
 
@@ -2163,7 +2270,10 @@ struct TransmitState {
 
 #[derive(Copy, Clone)]
 pub(super) enum TransmitOrigin {
-    Host,
+    /// Created by the host with a producer of `item`s.
+    Host {
+        item: TypeId,
+    },
     GuestFuture(ComponentInstanceId, TypeFutureTableIndex),
     GuestStream(ComponentInstanceId, TypeStreamTableIndex),
 }
@@ -2622,7 +2732,9 @@ impl<T> StoreContextMut<'_, T> {
     {
         let token = StoreToken::new(self.as_context_mut());
         let state = self.0.concurrent_state_mut()?;
-        let (_, read) = state.new_transmit(TransmitOrigin::Host)?;
+        let (_, read) = state.new_transmit(TransmitOrigin::Host {
+            item: TypeId::of::<P::Item>(),
+        })?;
         let producer = Arc::new(LockedState::new((Box::pin(producer), P::Buffer::default())));
         let id = state.get_mut(read)?.state;
         let mut dropped = false;
@@ -2813,6 +2925,9 @@ impl<T> StoreContextMut<'_, T> {
         kind: TransmitKind,
         consumer: C,
     ) -> Result<()> {
+        if let TransmitOrigin::Host { item } = self.0.transmit_origin(idx)? {
+            ensure_val_items_match::<C::Item>(item)?;
+        }
         let token = StoreToken::new(self.as_context_mut());
         let id = self.0.host_reader_take(idx)?;
         let state = self.0.concurrent_state_mut()?;
