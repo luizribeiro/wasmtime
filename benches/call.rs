@@ -1198,8 +1198,8 @@ mod component_streams {
     use super::*;
     use futures::channel::oneshot;
     use wasmtime::component::{
-        Component, ComponentType, Instance, Lift, Linker, Lower, Source, StreamConsumer,
-        StreamReader, StreamResult, TypedFunc,
+        Component, ComponentType, Instance, Lift, Linker, Lower, Source, StreamAny, StreamConsumer,
+        StreamReader, StreamResult, Type, TypedFunc, Val,
     };
 
     /// Items per stream in each iteration.
@@ -1216,6 +1216,14 @@ mod component_streams {
             "string",
             STRING_DATA,
             "hello".to_string(),
+        );
+        vals(&mut group, &engine, "u32", "", Val::U32(0));
+        vals(
+            &mut group,
+            &engine,
+            "string",
+            STRING_DATA,
+            Val::String("hello".into()),
         );
     }
 
@@ -1474,6 +1482,54 @@ mod component_streams {
                 let (reader,) = run_await(fill.call_async(&mut store, (ITEMS,))).unwrap();
                 let (consumer, done) = Discard::new(read_typed::<T>);
                 reader.pipe(&mut store, consumer).unwrap();
+                run_await(store.run_concurrent(async |_| done.await))
+                    .unwrap()
+                    .unwrap();
+            });
+        });
+    }
+
+    fn read_vals(
+        src: &mut Source<'_, Val>,
+        store: StoreContextMut<'_, ()>,
+        buffer: &mut Vec<Val>,
+    ) -> Result<()> {
+        src.read_vals(store, buffer)
+    }
+
+    /// Benchmarks host-to-wasm and wasm-to-host streams of `item`s as `Val`s,
+    /// for comparison with `typed`.
+    fn vals(
+        group: &mut BenchmarkGroup<'_, WallTime>,
+        engine: &Engine,
+        name: &str,
+        data: &str,
+        item: Val,
+    ) {
+        let component = component(engine, name, data);
+
+        let (mut store, instance) = instantiate(engine, &component);
+        let func = instance.get_func(&mut store, "drain").unwrap();
+        let Type::Stream(ty) = func.ty(&store).params().next().unwrap().1 else {
+            unreachable!()
+        };
+        let drain = func.typed::<(StreamAny,), ()>(&store).unwrap();
+        group.bench_function(&format!("host-to-wasm - val - {name}"), |b| {
+            b.iter(|| {
+                let items = vec![item.clone(); ITEMS as usize];
+                let stream = StreamAny::new(&mut store, ty.clone(), items).unwrap();
+                run_await(drain.call_async(&mut store, (stream,))).unwrap();
+            });
+        });
+
+        let (mut store, instance) = instantiate(engine, &component);
+        let fill: TypedFunc<(u32,), (StreamAny,)> =
+            instance.get_typed_func(&mut store, "fill").unwrap();
+        group.bench_function(&format!("wasm-to-host - val - {name}"), |b| {
+            b.iter(|| {
+                let (stream,) = run_await(fill.call_async(&mut store, (ITEMS,))).unwrap();
+                let (consumer, done) = Discard::new(read_vals);
+                stream.pipe(&mut store, consumer).unwrap();
                 run_await(store.run_concurrent(async |_| done.await))
                     .unwrap()
                     .unwrap();
