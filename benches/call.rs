@@ -20,6 +20,9 @@ fn measure_execution_time(c: &mut Criterion) {
     #[cfg(feature = "component-model-async")]
     component_async::measure_execution_time(c);
 
+    #[cfg(feature = "component-model-async")]
+    component_streams::measure_execution_time(c);
+
     indirect::measure_execution_time(c);
 }
 
@@ -1185,6 +1188,295 @@ mod component_async {
                 }))
                 .unwrap();
                 start.elapsed()
+            });
+        });
+    }
+}
+
+#[cfg(feature = "component-model-async")]
+mod component_streams {
+    use super::*;
+    use futures::channel::oneshot;
+    use wasmtime::component::{
+        Component, ComponentType, Instance, Lift, Linker, Lower, Source, StreamConsumer,
+        StreamReader, StreamResult, TypedFunc,
+    };
+
+    /// Items per stream in each iteration.
+    const ITEMS: u32 = 1024;
+
+    pub fn measure_execution_time(c: &mut Criterion) {
+        let mut group = c.benchmark_group("component-streams");
+        group.throughput(criterion::Throughput::Elements(ITEMS.into()));
+        let engine = engine();
+        typed::<u32>(&mut group, &engine, "u32", "", 0);
+        typed::<String>(
+            &mut group,
+            &engine,
+            "string",
+            STRING_DATA,
+            "hello".to_string(),
+        );
+    }
+
+    fn engine() -> Engine {
+        let mut config = Config::new();
+        config.wasm_component_model_async(true);
+        Engine::new(&config).unwrap()
+    }
+
+    /// Fills the 64 items at address 1024 that `fill` writes with `(ptr, len)`
+    /// pairs pointing at "hello".
+    const STRING_DATA: &str = r#"
+        (data (i32.const 512) "hello")
+        (func $init
+          (local $i i32)
+          (loop $l
+            (i32.store (i32.add (i32.const 1024) (i32.shl (local.get $i) (i32.const 3)))
+              (i32.const 512))
+            (i32.store (i32.add (i32.const 1028) (i32.shl (local.get $i) (i32.const 3)))
+              (i32.const 5))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br_if $l (i32.lt_u (local.get $i) (i32.const 64)))))
+        (start $init)
+    "#;
+
+    /// Returns a component for `stream<{payload}>` whose async `drain` export
+    /// reads a stream until it is dropped, and whose async `fill` export
+    /// returns a new stream to which it writes `n` items copied from the 64
+    /// at address 1024, initialized by `data`.
+    fn component(engine: &Engine, payload: &str, data: &str) -> Component {
+        let wat = format!(
+            r#"
+(component
+  (type $s (stream {payload}))
+  (core module $libc
+    (memory (export "mem") 1)
+    (global $heap (mut i32) (i32.const 4096))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $ret i32)
+      (local.set $ret
+        (i32.and
+          (i32.add (global.get $heap) (i32.sub (local.get 2) (i32.const 1)))
+          (i32.sub (i32.const 0) (local.get 2))))
+      (global.set $heap (i32.add (local.get $ret) (local.get 3)))
+      (local.get $ret))
+    (func (export "reset") (global.set $heap (i32.const 4096))))
+  (core instance $libc (instantiate $libc))
+  (core func $stream.new (canon stream.new $s))
+  (core func $stream.read
+    (canon stream.read $s async (memory (core memory $libc "mem"))
+      (realloc (core func $libc "realloc"))))
+  (core func $stream.write
+    (canon stream.write $s async (memory (core memory $libc "mem"))))
+  (core func $stream.drop-readable (canon stream.drop-readable $s))
+  (core func $stream.drop-writable (canon stream.drop-writable $s))
+  (core func $drain.return (canon task.return))
+  (core func $fill.return (canon task.return (result $s)))
+  (core func $waitable-set.new (canon waitable-set.new))
+  (core func $waitable.join (canon waitable.join))
+  (core module $m
+    (import "" "mem" (memory 1))
+    (import "" "reset" (func $reset))
+    (import "" "stream.new" (func $stream.new (result i64)))
+    (import "" "stream.read" (func $stream.read (param i32 i32 i32) (result i32)))
+    (import "" "stream.write" (func $stream.write (param i32 i32 i32) (result i32)))
+    (import "" "stream.drop-readable" (func $stream.drop-readable (param i32)))
+    (import "" "stream.drop-writable" (func $stream.drop-writable (param i32)))
+    (import "" "drain.return" (func $drain.return))
+    (import "" "fill.return" (func $fill.return (param i32)))
+    (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
+    (import "" "waitable.join" (func $waitable.join (param i32 i32)))
+
+    (global $in (mut i32) (i32.const 0))
+    (global $out (mut i32) (i32.const 0))
+    (global $left (mut i32) (i32.const 0))
+    (global $ws (mut i32) (i32.const 0))
+    {data}
+
+    ;; Waits for `$handle`, returning CALLBACK_CODE_WAIT for `$ws`.
+    (func $wait (param $handle i32) (result i32)
+      (call $waitable.join (local.get $handle) (global.get $ws))
+      (i32.or (i32.const 2) (i32.shl (global.get $ws) (i32.const 4))))
+
+    (func $read (result i32)
+      (local $code i32)
+      (call $reset)
+      (local.set $code
+        (call $stream.read (global.get $in) (i32.const 1024) (i32.const 64)))
+      (if (i32.eq (local.get $code) (i32.const -1))
+        (then (return (call $wait (global.get $in)))))
+      (call $on-read (local.get $code)))
+
+    (func $on-read (param $code i32) (result i32)
+      (if (i32.eqz (i32.and (local.get $code) (i32.const 0xf)))
+        (then (return (call $read))))
+      (call $stream.drop-readable (global.get $in))
+      (call $drain.return)
+      (i32.const 0)) ;; CALLBACK_CODE_EXIT
+
+    (func (export "drain") (param $in i32) (result i32)
+      (global.set $in (local.get $in))
+      (if (i32.eqz (global.get $ws))
+        (then (global.set $ws (call $waitable-set.new))))
+      (call $read))
+
+    (func $write (result i32)
+      (local $code i32)
+      (if (i32.eqz (global.get $left))
+        (then
+          (call $stream.drop-writable (global.get $out))
+          (return (i32.const 0)))) ;; CALLBACK_CODE_EXIT
+      (local.set $code
+        (call $stream.write (global.get $out) (i32.const 1024)
+          (select (global.get $left) (i32.const 64)
+            (i32.lt_u (global.get $left) (i32.const 64)))))
+      (if (i32.eq (local.get $code) (i32.const -1))
+        (then (return (call $wait (global.get $out)))))
+      (call $on-write (local.get $code)))
+
+    (func $on-write (param $code i32) (result i32)
+      ;; The host consumer takes everything, so anything else is a bug here.
+      (if (i32.ne (i32.and (local.get $code) (i32.const 0xf)) (i32.const 0))
+        (then unreachable))
+      (global.set $left
+        (i32.sub (global.get $left) (i32.shr_u (local.get $code) (i32.const 4))))
+      (call $write))
+
+    (func (export "fill") (param $n i32) (result i32)
+      (local $rw i64)
+      (global.set $left (local.get $n))
+      (local.set $rw (call $stream.new))
+      (global.set $out (i32.wrap_i64 (i64.shr_u (local.get $rw) (i64.const 32))))
+      (if (i32.eqz (global.get $ws))
+        (then (global.set $ws (call $waitable-set.new))))
+      (call $fill.return (i32.wrap_i64 (local.get $rw)))
+      (call $write))
+
+    (func (export "cb") (param $event i32) (param $handle i32) (param $code i32) (result i32)
+      (call $waitable.join (local.get $handle) (i32.const 0))
+      (if (i32.eq (local.get $handle) (global.get $in))
+        (then (return (call $on-read (local.get $code)))))
+      (call $on-write (local.get $code))))
+  (core instance $i (instantiate $m (with "" (instance
+    (export "mem" (memory $libc "mem"))
+    (export "reset" (func $libc "reset"))
+    (export "stream.new" (func $stream.new))
+    (export "stream.read" (func $stream.read))
+    (export "stream.write" (func $stream.write))
+    (export "stream.drop-readable" (func $stream.drop-readable))
+    (export "stream.drop-writable" (func $stream.drop-writable))
+    (export "drain.return" (func $drain.return))
+    (export "fill.return" (func $fill.return))
+    (export "waitable-set.new" (func $waitable-set.new))
+    (export "waitable.join" (func $waitable.join))))))
+  (func (export "drain") async (param "s" $s)
+    (canon lift (core func $i "drain") async (callback (core func $i "cb"))))
+  (func (export "fill") async (param "n" u32) (result $s)
+    (canon lift (core func $i "fill") async (callback (core func $i "cb"))))
+)
+"#
+        );
+        Component::new(engine, wat).unwrap()
+    }
+
+    fn instantiate(engine: &Engine, component: &Component) -> (Store<()>, Instance) {
+        let mut store = Store::new(engine, ());
+        let instance =
+            run_await(Linker::new(engine).instantiate_async(&mut store, component)).unwrap();
+        (store, instance)
+    }
+
+    /// A consumer which reads and drops every item, using `read`, and which
+    /// signals `done` when dropped at the end of the stream.
+    struct Discard<T> {
+        read: fn(&mut Source<'_, T>, StoreContextMut<'_, ()>, &mut Vec<T>) -> Result<()>,
+        buffer: Vec<T>,
+        done: Option<oneshot::Sender<()>>,
+    }
+
+    impl<T> Discard<T> {
+        fn new(
+            read: fn(&mut Source<'_, T>, StoreContextMut<'_, ()>, &mut Vec<T>) -> Result<()>,
+        ) -> (Self, oneshot::Receiver<()>) {
+            let (tx, rx) = oneshot::channel();
+            let consumer = Discard {
+                read,
+                buffer: Vec::with_capacity(64),
+                done: Some(tx),
+            };
+            (consumer, rx)
+        }
+    }
+
+    impl<T> Drop for Discard<T> {
+        fn drop(&mut self) {
+            let _ = self.done.take().unwrap().send(());
+        }
+    }
+
+    impl<T: Send + 'static> StreamConsumer<()> for Discard<T> {
+        type Item = T;
+
+        fn poll_consume(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            store: StoreContextMut<()>,
+            mut src: Source<'_, T>,
+            _finish: bool,
+        ) -> Poll<Result<StreamResult>> {
+            let this = &mut *self;
+            this.buffer.clear();
+            (this.read)(&mut src, store, &mut this.buffer)?;
+            Poll::Ready(Ok(StreamResult::Completed))
+        }
+    }
+
+    impl<T> Unpin for Discard<T> {}
+
+    fn read_typed<T: Lift + 'static>(
+        src: &mut Source<'_, T>,
+        store: StoreContextMut<'_, ()>,
+        buffer: &mut Vec<T>,
+    ) -> Result<()> {
+        src.read(store, buffer)
+    }
+
+    /// Benchmarks host-to-wasm and wasm-to-host streams of statically typed
+    /// `item`s.
+    fn typed<T>(
+        group: &mut BenchmarkGroup<'_, WallTime>,
+        engine: &Engine,
+        name: &str,
+        data: &str,
+        item: T,
+    ) where
+        T: ComponentType + Lower + Lift + Clone + Send + Sync + Unpin + 'static,
+    {
+        let component = component(engine, name, data);
+
+        let (mut store, instance) = instantiate(engine, &component);
+        let drain: TypedFunc<(StreamReader<T>,), ()> =
+            instance.get_typed_func(&mut store, "drain").unwrap();
+        group.bench_function(&format!("host-to-wasm - typed - {name}"), |b| {
+            b.iter(|| {
+                let items = vec![item.clone(); ITEMS as usize];
+                let reader = StreamReader::new(&mut store, items).unwrap();
+                run_await(drain.call_async(&mut store, (reader,))).unwrap();
+            });
+        });
+
+        let (mut store, instance) = instantiate(engine, &component);
+        let fill: TypedFunc<(u32,), (StreamReader<T>,)> =
+            instance.get_typed_func(&mut store, "fill").unwrap();
+        group.bench_function(&format!("wasm-to-host - typed - {name}"), |b| {
+            b.iter(|| {
+                let (reader,) = run_await(fill.call_async(&mut store, (ITEMS,))).unwrap();
+                let (consumer, done) = Discard::new(read_typed::<T>);
+                reader.pipe(&mut store, consumer).unwrap();
+                run_await(store.run_concurrent(async |_| done.await))
+                    .unwrap()
+                    .unwrap();
             });
         });
     }
