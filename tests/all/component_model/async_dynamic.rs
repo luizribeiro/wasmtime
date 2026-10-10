@@ -1,11 +1,12 @@
+use std::any::{Any, TypeId};
 use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 use wasmtime::component::{
-    Component, FutureAny, FutureConsumer, FutureReader, Instance, Lift, Linker, Resource,
-    ResourceType, Source, StreamAny, StreamConsumer, StreamReader, StreamResult, Type, TypedFunc,
-    Val, types::StreamType,
+    Component, Destination, FutureAny, FutureConsumer, FutureReader, Instance, Lift, Linker,
+    Resource, ResourceType, Source, StreamAny, StreamConsumer, StreamProducer, StreamReader,
+    StreamResult, Type, TypedFunc, Val, VecBuffer, types::StreamType,
 };
 use wasmtime::{Config, Engine, Result, Store, StoreContextMut};
 
@@ -1140,5 +1141,70 @@ async fn val_stream_lowering_failure_keeps_moved_resources_moved() -> Result<()>
     // The first item was moved into the guest before the second failed.
     assert!(sent.try_into_resource::<HostThing>(&mut store).is_err());
     assert_eq!(kept.try_into_resource::<HostThing>(&mut store)?.rep(), 8);
+    Ok(())
+}
+
+/// A producer of no `Val`s which can be recovered with `StreamAny::try_into`.
+struct Tagged(u32);
+
+impl StreamProducer<()> for Tagged {
+    type Item = Val;
+    type Buffer = VecBuffer<Val>;
+
+    fn poll_produce<'a>(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _store: StoreContextMut<'a, ()>,
+        _dst: Destination<'a, Val, Self::Buffer>,
+        _finish: bool,
+    ) -> Poll<Result<StreamResult>> {
+        Poll::Ready(Ok(StreamResult::Dropped))
+    }
+
+    fn try_into(me: Pin<Box<Self>>, ty: TypeId) -> Result<Box<dyn Any>, Pin<Box<Self>>> {
+        if ty == TypeId::of::<Tagged>() {
+            let me: Box<Self> = Pin::into_inner(me);
+            Ok(me)
+        } else {
+            Err(me)
+        }
+    }
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn val_streams_returned_by_guest_recover_their_producers() -> Result<()> {
+    let (mut store, instance) = instantiate_echo().await?;
+    let echo = instance.get_func(&mut store, "echo-s").unwrap();
+    let Type::Stream(ty) = echo.ty(&store).params().next().unwrap().1 else {
+        unreachable!()
+    };
+    let echo = echo.typed::<(StreamAny,), (StreamAny,)>(&store)?;
+    let a = StreamAny::new(&mut store, ty.clone(), Tagged(1))?;
+    let b = StreamAny::new(&mut store, ty, Tagged(2))?;
+
+    // Streams of the same type come back in a different order, as new
+    // `StreamAny`s, and are still told apart.
+    let (b,) = echo.call_async(&mut store, (b,)).await?;
+    let (a,) = echo.call_async(&mut store, (a,)).await?;
+
+    let a = match a.try_into::<String>(&mut store) {
+        Ok(_) => panic!("`Tagged` does not convert into `String`"),
+        Err(a) => a,
+    };
+    assert_eq!(b.try_into::<Tagged>(&mut store).ok().unwrap().0, 2);
+    assert_eq!(a.try_into::<Tagged>(&mut store).ok().unwrap().0, 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn guest_stream_cannot_be_converted_into_a_producer() -> Result<()> {
+    let mut writer = StreamWriter::new("(type $s (stream u32))", "").await?;
+    let mut stream = match writer.stream.clone().try_into::<Tagged>(&mut writer.store) {
+        Ok(_) => panic!("a guest stream has no host producer"),
+        Err(stream) => stream,
+    };
+    stream.close(&mut writer.store)?;
     Ok(())
 }

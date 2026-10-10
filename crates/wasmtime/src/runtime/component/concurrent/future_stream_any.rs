@@ -310,6 +310,28 @@ impl StreamAny {
         }
     }
 
+    /// Attempt to consume this stream by converting it into the producer it
+    /// was created with, or another value that producer converts itself into.
+    ///
+    /// This is the dynamically typed counterpart of [`StreamReader::try_into`],
+    /// with the same conditions: it returns `Ok(_)` if and only if the stream
+    /// was created by the host and its producer's [`StreamProducer::try_into`]
+    /// returns `Ok(_)` for `TypeId::of::<V>()`. This identifies a stream
+    /// created by the host, for example with [`StreamAny::new`], when a guest
+    /// returns it, even among other streams of the same type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this stream has already been closed, or if this stream doesn't
+    /// belong to the specified `store`.
+    pub fn try_into<V: 'static>(self, store: impl AsContextMut) -> Result<V, Self> {
+        // `StreamReader::try_into` only consults the producer, never its own
+        // item type, so `Val` stands in for whatever this stream's items are.
+        StreamReader::<Val>::new_(self.idx)
+            .try_into(store)
+            .map_err(|_| self)
+    }
+
     /// Set the consumer that accepts the items delivered to this stream as
     /// [`Val`]s.
     ///
