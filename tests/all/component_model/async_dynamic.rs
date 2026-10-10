@@ -6,7 +6,8 @@ use tokio::sync::oneshot;
 use wasmtime::component::{
     Component, ComponentType, Destination, FutureAny, FutureConsumer, FutureReader, Instance, Lift,
     Linker, Lower, Resource, ResourceType, Source, StreamAny, StreamConsumer, StreamProducer,
-    StreamReader, StreamResult, Type, TypedFunc, Val, VecBuffer, types::StreamType,
+    StreamReader, StreamResult, Type, TypedFunc, Val, VecBuffer,
+    types::{FutureType, StreamType},
 };
 use wasmtime::{Config, Engine, Result, Store, StoreContextMut};
 
@@ -1153,6 +1154,376 @@ async fn val_stream_lowering_failure_keeps_moved_resources_moved() -> Result<()>
     // The first item was moved into the guest before the second failed.
     assert!(sent.try_into_resource::<HostThing>(&mut store).is_err());
     assert_eq!(kept.try_into_resource::<HostThing>(&mut store)?.rep(), 8);
+    Ok(())
+}
+
+/// Returns a component whose async `forward` export takes a future of type
+/// `$f`, defined by `types`, and returns a new future of the same type which
+/// it resolves with the first's value.
+fn future_forwarder(types: &str) -> String {
+    format!(
+        r#"
+(component
+  {types}
+  {LIBC}
+  (core func $future.new (canon future.new $f))
+  (core func $future.read
+    (canon future.read $f async (memory (core memory $libc "mem"))
+      (realloc (core func $libc "realloc"))))
+  (core func $future.write
+    (canon future.write $f async (memory (core memory $libc "mem"))))
+  (core func $future.drop-readable (canon future.drop-readable $f))
+  (core func $future.drop-writable (canon future.drop-writable $f))
+  (core func $task.return (canon task.return (result $f)))
+  (core func $waitable-set.new (canon waitable-set.new))
+  (core func $waitable.join (canon waitable.join))
+  (core module $m
+    (import "" "future.new" (func $future.new (result i64)))
+    (import "" "future.read" (func $future.read (param i32 i32) (result i32)))
+    (import "" "future.write" (func $future.write (param i32 i32) (result i32)))
+    (import "" "future.drop-readable" (func $future.drop-readable (param i32)))
+    (import "" "future.drop-writable" (func $future.drop-writable (param i32)))
+    (import "" "task.return" (func $task.return (param i32)))
+    (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
+    (import "" "waitable.join" (func $waitable.join (param i32 i32)))
+
+    (global $in (mut i32) (i32.const 0))
+    (global $out (mut i32) (i32.const 0))
+    (global $ws (mut i32) (i32.const 0))
+
+    ;; Waits for `$handle`, returning CALLBACK_CODE_WAIT for `$ws`.
+    (func $wait (param $handle i32) (result i32)
+      (call $waitable.join (local.get $handle) (global.get $ws))
+      (i32.or (i32.const 2) (i32.shl (global.get $ws) (i32.const 4))))
+
+    ;; Writes the value the read delivered.
+    (func $on-read (param $code i32) (result i32)
+      (if (i32.ne (local.get $code) (i32.const 0)) ;; COMPLETED
+        (then unreachable))
+      (local.set $code (call $future.write (global.get $out) (i32.const 1024)))
+      (if (i32.eq (local.get $code) (i32.const -1))
+        (then (return (call $wait (global.get $out)))))
+      (call $on-write (local.get $code)))
+
+    (func $on-write (param $code i32) (result i32)
+      (if (i32.ne (local.get $code) (i32.const 0)) ;; COMPLETED
+        (then unreachable))
+      (call $future.drop-readable (global.get $in))
+      (call $future.drop-writable (global.get $out))
+      (i32.const 0)) ;; CALLBACK_CODE_EXIT
+
+    (func (export "forward") (param $in i32) (result i32)
+      (local $rw i64)
+      (local $code i32)
+      (global.set $in (local.get $in))
+      (local.set $rw (call $future.new))
+      (global.set $out (i32.wrap_i64 (i64.shr_u (local.get $rw) (i64.const 32))))
+      (global.set $ws (call $waitable-set.new))
+      (call $task.return (i32.wrap_i64 (local.get $rw)))
+      (local.set $code (call $future.read (global.get $in) (i32.const 1024)))
+      (if (i32.eq (local.get $code) (i32.const -1))
+        (then (return (call $wait (global.get $in)))))
+      (call $on-read (local.get $code)))
+
+    (func (export "cb") (param $event i32) (param $handle i32) (param $code i32) (result i32)
+      (call $waitable.join (local.get $handle) (i32.const 0))
+      (if (i32.eq (local.get $handle) (global.get $in))
+        (then (return (call $on-read (local.get $code)))))
+      (call $on-write (local.get $code))))
+  (core instance $i (instantiate $m (with "" (instance
+    (export "future.new" (func $future.new))
+    (export "future.read" (func $future.read))
+    (export "future.write" (func $future.write))
+    (export "future.drop-readable" (func $future.drop-readable))
+    (export "future.drop-writable" (func $future.drop-writable))
+    (export "task.return" (func $task.return))
+    (export "waitable-set.new" (func $waitable-set.new))
+    (export "waitable.join" (func $waitable.join))))))
+  (func (export "forward") async (param "f" $f) (result $f)
+    (canon lift (core func $i "forward") async (callback (core func $i "cb"))))
+)
+"#
+    )
+}
+
+/// Instantiates `future_forwarder(types)`, returning its store, the type of
+/// future it forwards, and its `forward` export.
+async fn future_forwarder_instance(
+    types: &str,
+) -> Result<(Store<()>, FutureType, TypedFunc<(FutureAny,), (FutureAny,)>)> {
+    let (store, ty, forward) = instantiate_forwarder(&future_forwarder(types)).await?;
+    let Type::Future(ty) = ty else { unreachable!() };
+    Ok((store, ty, forward))
+}
+
+/// Resolves a new `Val` future of type `ty` with `value`, passes it to
+/// `forward`, and reads what comes back as a `Val`.
+async fn forward_future_val(
+    store: &mut Store<()>,
+    ty: FutureType,
+    forward: &TypedFunc<(FutureAny,), (FutureAny,)>,
+    value: Val,
+) -> Result<Vec<Val>> {
+    let future = FutureAny::new(&mut *store, ty, async { wasmtime::error::Ok(value) })?;
+    let (future,) = forward.call_async(&mut *store, (future,)).await?;
+    let (consumer, done) = Collect::vals();
+    future.pipe(&mut *store, consumer)?;
+    Ok(store.run_concurrent(async |_| done.await).await??)
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn val_future_round_trips_through_guest() -> Result<()> {
+    let cases = [
+        ("(type $f (future u32))", Val::U32(7)),
+        (
+            "(type $f (future string))",
+            Val::String("long enough to need realloc".into()),
+        ),
+        (
+            r#"(type $r (record (field "a" u32) (field "b" string)))
+               (export $r' "r" (type $r))
+               (type $f (future $r'))"#,
+            record(&[("a", Val::U32(1)), ("b", Val::String("x".into()))]),
+        ),
+        (
+            "(type $f (future (list u16)))",
+            Val::List(vec![Val::U16(1), Val::U16(2)]),
+        ),
+    ];
+    for (types, value) in cases {
+        let (mut store, ty, forward) = future_forwarder_instance(types).await?;
+        assert_eq!(
+            forward_future_val(&mut store, ty, &forward, value.clone()).await?,
+            [value],
+            "{types}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn val_future_moves_resource_through_guest() -> Result<()> {
+    let (mut store, ty, forward) = future_forwarder_instance(
+        r#"(import "r" (type $r (sub resource)))
+           (type $f (future (own $r)))"#,
+    )
+    .await?;
+    let r = Resource::<HostThing>::new_own(7).try_into_resource_any(&mut store)?;
+    let values = forward_future_val(&mut store, ty, &forward, Val::Resource(r)).await?;
+    let [Val::Resource(r)] = values[..] else {
+        panic!("expected one resource, found {values:?}")
+    };
+    assert_eq!(r.try_into_resource::<HostThing>(&mut store)?.rep(), 7);
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn val_future_value_is_typechecked_when_lowered() -> Result<()> {
+    let (mut store, ty, forward) = future_forwarder_instance("(type $f (future u32))").await?;
+    let value = Val::String("not a u32".into());
+    let err = forward_future_val(&mut store, ty, &forward, value)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("type mismatch: expected u32, found string"),
+        "{err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn val_future_read_host_to_host() -> Result<()> {
+    let (mut store, ty, _) = future_forwarder_instance("(type $f (future string))").await?;
+    let value = Val::String("a".into());
+    let future = FutureAny::new(&mut store, ty.clone(), {
+        let value = value.clone();
+        async { wasmtime::error::Ok(value) }
+    })?;
+    assert_eq!(future.ty(), Some(ty));
+    let (consumer, done) = Collect::vals();
+    future.pipe(&mut store, consumer)?;
+    assert_eq!(store.run_concurrent(async |_| done.await).await??, [value]);
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn val_future_and_typed_end_refuse_each_other() -> Result<()> {
+    let (mut store, ty, _) = future_forwarder_instance("(type $f (future u32))").await?;
+
+    let mut future = FutureAny::new(&mut store, ty, async { wasmtime::error::Ok(Val::U32(1)) })?;
+    let reader = future.clone().try_into_future_reader::<u32>()?;
+    let err = reader
+        .pipe(&mut store, Collect::<u32>::new().0)
+        .unwrap_err();
+    assert!(err.to_string().contains("both use `Val` items"), "{err:?}");
+    future.close(&mut store)?;
+
+    let mut future = FutureReader::new(&mut store, async { wasmtime::error::Ok(1_u32) })?
+        .try_into_future_any(&mut store)?;
+    assert!(future.ty().is_none());
+    let err = future
+        .clone()
+        .pipe(&mut store, Collect::vals().0)
+        .unwrap_err();
+    assert!(err.to_string().contains("both use `Val` items"), "{err:?}");
+    future.close(&mut store)?;
+
+    // Still refused after passing through a guest, which gives it a
+    // component model type.
+    let (mut store, instance) = instantiate_echo().await?;
+    let echo =
+        instance.get_typed_func::<(FutureReader<String>,), (FutureAny,)>(&mut store, "echo-f")?;
+    let reader = FutureReader::new(&mut store, async { wasmtime::error::Ok("a".to_string()) })?;
+    let (mut future,) = echo.call_async(&mut store, (reader,)).await?;
+    assert!(future.ty().is_some());
+    let err = future
+        .clone()
+        .pipe(&mut store, Collect::vals().0)
+        .unwrap_err();
+    assert!(err.to_string().contains("both use `Val` items"), "{err:?}");
+    future.close(&mut store)?;
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn payload_less_val_future_refused() -> Result<()> {
+    let (mut store, ty, _) = future_forwarder_instance("(type $f (future))").await?;
+    let err = FutureAny::new(&mut store, ty, async {
+        wasmtime::error::Ok(Val::Bool(true))
+    })
+    .unwrap_err();
+    assert!(err.to_string().contains("payload-less"), "{err:?}");
+    Ok(())
+}
+
+/// Returns a component whose `new` export creates a future of type `$f`,
+/// defined by `types`, whose `write` export writes the value encoded at
+/// address 100 by `data`, and whose `close` export drops the writable end.
+fn future_writer(types: &str, data: &str) -> String {
+    format!(
+        r#"
+(component
+  {types}
+  {LIBC}
+  (core func $future.new (canon future.new $f))
+  (core func $future.write
+    (canon future.write $f async (memory (core memory $libc "mem"))))
+  (core func $future.drop-writable (canon future.drop-writable $f))
+  (core module $m
+    (import "" "mem" (memory 1))
+    (import "" "future.new" (func $future.new (result i64)))
+    (import "" "future.write" (func $future.write (param i32 i32) (result i32)))
+    (import "" "future.drop-writable" (func $future.drop-writable (param i32)))
+
+    (global $w (mut i32) (i32.const 0))
+    {data}
+
+    (func (export "new") (result i32)
+      (local $rw i64)
+      (local.set $rw (call $future.new))
+      (global.set $w (i32.wrap_i64 (i64.shr_u (local.get $rw) (i64.const 32))))
+      (i32.wrap_i64 (local.get $rw)))
+    (func (export "write") (result i32)
+      (call $future.write (global.get $w) (i32.const 100)))
+    (func (export "close")
+      (call $future.drop-writable (global.get $w))))
+  (core instance $i (instantiate $m (with "" (instance
+    (export "mem" (memory $libc "mem"))
+    (export "future.new" (func $future.new))
+    (export "future.write" (func $future.write))
+    (export "future.drop-writable" (func $future.drop-writable))))))
+  (func (export "new") (result $f) (canon lift (core func $i "new")))
+  (func (export "write") (result u32) (canon lift (core func $i "write")))
+  (func (export "close") (canon lift (core func $i "close")))
+)
+"#
+    )
+}
+
+/// Instantiates `future_writer(types, data)`, returning its store, the
+/// future its `new` export created, and its `write` and `close` exports.
+async fn guest_future(
+    types: &str,
+    data: &str,
+) -> Result<(
+    Store<()>,
+    FutureAny,
+    TypedFunc<(), (u32,)>,
+    TypedFunc<(), ()>,
+)> {
+    let mut config = Config::new();
+    config.wasm_component_model_async(true);
+    let engine = Engine::new(&config)?;
+    let component = Component::new(&engine, future_writer(types, data))?;
+    let mut store = Store::new(&engine, ());
+    let instance = Linker::new(&engine)
+        .instantiate_async(&mut store, &component)
+        .await?;
+    let new = instance.get_typed_func::<(), (FutureAny,)>(&mut store, "new")?;
+    let write = instance.get_typed_func::<(), (u32,)>(&mut store, "write")?;
+    let close = instance.get_typed_func::<(), ()>(&mut store, "close")?;
+    let (future,) = new.call_async(&mut store, ()).await?;
+    Ok((store, future, write, close))
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn guest_future_read_as_val() -> Result<()> {
+    let cases = [
+        (
+            "(type $f (future u32))",
+            r#"(data (i32.const 100) "\07\00\00\00")"#,
+            Val::U32(7),
+        ),
+        (
+            "(type $f (future string))",
+            r#"(data (i32.const 100) "\c8\00\00\00\02\00\00\00")
+               (data (i32.const 200) "ab")"#,
+            Val::String("ab".into()),
+        ),
+    ];
+    for (types, data, expected) in cases {
+        let (mut store, future, write, close) = guest_future(types, data).await?;
+        assert!(future.ty().unwrap().ty().is_some());
+        let (consumer, done) = Collect::vals();
+        future.pipe(&mut store, consumer)?;
+        assert_eq!(write.call_async(&mut store, ()).await?, (0,)); // COMPLETED
+        close.call_async(&mut store, ()).await?;
+        assert_eq!(
+            store.run_concurrent(async |_| done.await).await??,
+            [expected],
+            "{types}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn payload_less_guest_future_refuses_val() -> Result<()> {
+    let (mut store, mut future, _, _) = guest_future("(type $f (future))", "").await?;
+    assert!(future.ty().unwrap().ty().is_none());
+    let err = future
+        .clone()
+        .pipe(&mut store, Collect::vals().0)
+        .unwrap_err();
+    assert!(err.to_string().contains("payload-less"), "{err:?}");
+    future.close(&mut store)?;
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn unresolved_val_future_can_be_closed() -> Result<()> {
+    let (mut store, ty, _) = future_forwarder_instance("(type $f (future u32))").await?;
+    let mut future = FutureAny::new(&mut store, ty, std::future::pending::<Result<Val>>())?;
+    future.close(&mut store)?;
     Ok(())
 }
 

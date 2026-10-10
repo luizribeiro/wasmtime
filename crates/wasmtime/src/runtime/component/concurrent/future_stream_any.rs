@@ -6,8 +6,8 @@ use crate::component::matching::InstanceType;
 use crate::component::resources::HostResourceIndex;
 use crate::component::types::{self, FutureType, StreamType};
 use crate::component::{
-    ComponentInstanceId, ComponentType, FutureReader, Lift, Lower, StreamConsumer, StreamProducer,
-    StreamReader, Val,
+    ComponentInstanceId, ComponentType, FutureConsumer, FutureProducer, FutureReader, Lift, Lower,
+    StreamConsumer, StreamProducer, StreamReader, Val,
 };
 use crate::store::StoreOpaque;
 use crate::{AsContextMut, Result, bail, ensure, error::Context};
@@ -49,6 +49,40 @@ pub struct FutureAny {
 }
 
 impl FutureAny {
+    /// Create a new future of type `ty` whose value is written by `producer`
+    /// as a [`Val`].
+    ///
+    /// This is the dynamically typed counterpart of [`FutureReader::new`].
+    /// The value is not checked against `ty` until it is lowered into a
+    /// guest, with the same rules as arguments to
+    /// [`Func::call`](crate::component::Func::call); a value of the wrong type
+    /// then fails that read. A value passed to a host consumer with
+    /// [`FutureAny::pipe`] is moved as it is, without being checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `ty` has no payload type (`future` rather than
+    /// `future<T>`), if the resource table for this store is full, or if
+    /// [`Config::concurrency_support`] is not enabled.
+    ///
+    /// [`Config::concurrency_support`]: crate::Config::concurrency_support
+    pub fn new<S: AsContextMut>(
+        store: S,
+        ty: FutureType,
+        producer: impl FutureProducer<S::Data, Item = Val>,
+    ) -> Result<Self> {
+        ensure!(
+            ty.ty().is_some(),
+            "payload-less futures have no `Val` value to write"
+        );
+        Ok(FutureAny {
+            idx: futures_and_streams::new_host_future::<_, _, ValItems>(store, producer)?,
+            // The component model type is known exactly, as it is for futures
+            // created by guests.
+            ty: PayloadType::Guest(ty),
+        })
+    }
+
     fn lower_to_index<T>(&self, cx: &mut LowerContext<'_, T>, ty: InterfaceType) -> Result<u32> {
         // Note that unlike `FutureReader<T>` we need to perform an extra
         // typecheck to ensure that the dynamic type of this future matches
@@ -84,6 +118,55 @@ impl FutureAny {
         self.ty
             .typecheck_host::<T>(FutureType::equivalent_payload_host::<T>)?;
         Ok(FutureReader::new_(self.idx))
+    }
+
+    /// Returns the component model type of this future, if known.
+    ///
+    /// This is `None` for a future created by the host with a statically typed
+    /// producer, such as [`FutureReader::new`], which was then converted with
+    /// [`FutureAny::try_from_future_reader`] without passing through a guest.
+    /// Such futures have only a Rust type, not a component model type.
+    pub fn ty(&self) -> Option<FutureType> {
+        match &self.ty {
+            PayloadType::Guest(ty) => Some(ty.clone()),
+            PayloadType::Host { .. } => None,
+        }
+    }
+
+    /// Set the consumer that accepts the value of this future as a [`Val`].
+    ///
+    /// This is the dynamically typed counterpart of [`FutureReader::pipe`].
+    /// The consumer reads the value with [`Source::read_vals`]. A value written
+    /// by a guest is lifted as a [`Val`] of the payload type reported by
+    /// [`FutureAny::ty`]. A value written by a host producer of [`Val`]s, see
+    /// [`FutureAny::new`], is moved to the consumer as it is, without being
+    /// checked against that type.
+    ///
+    /// [`Source::read_vals`]: crate::component::Source::read_vals
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// * this future has no payload type (`future` rather than `future<T>`),
+    /// * this future was created by the host with a statically typed
+    ///   producer, which must be read with a statically typed consumer,
+    /// * this future has already been closed or otherwise transferred (e.g.
+    ///   lowered into a guest), or does not belong to `store`.
+    ///
+    /// In the first two cases the future is left open, so a clone of this
+    /// [`FutureAny`] can still be used to close it.
+    pub fn pipe<S: AsContextMut>(
+        self,
+        store: S,
+        consumer: impl FutureConsumer<S::Data, Item = Val>,
+    ) -> Result<()> {
+        if let PayloadType::Guest(ty) = &self.ty
+            && ty.ty().is_none()
+        {
+            bail!("payload-less futures have no `Val` value to read");
+        }
+        futures_and_streams::pipe_future(store, self.idx, consumer)
     }
 
     /// Attempts to convert `reader` to a [`FutureAny`], erasing its statically

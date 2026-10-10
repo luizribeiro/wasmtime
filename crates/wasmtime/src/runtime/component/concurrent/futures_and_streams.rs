@@ -1202,9 +1202,9 @@ impl Source<'_, Val> {
     /// Accept zero or more dynamically typed items from the writer.
     ///
     /// This is the counterpart of [`Source::read`] for consumers passed to
-    /// [`StreamAny::pipe`]. Items written by a guest are lifted one at a time,
-    /// each as a [`Val`] of the stream's payload type, so this costs more per
-    /// item than reading statically typed items.
+    /// [`StreamAny::pipe`] or [`FutureAny::pipe`]. Items written by a guest
+    /// are lifted one at a time, each as a [`Val`] of the payload type, so
+    /// this costs more per item than reading statically typed items.
     ///
     /// # Errors
     ///
